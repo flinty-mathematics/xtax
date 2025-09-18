@@ -1,0 +1,11 @@
+xtax
+====
+
+xtax is distributed under the MIT License (see LICENSE).
+
+Third-party components
+----------------------
+
+CLI11 (vendored under CLI11/)
+  A command-line parser, distributed under its own 3-clause BSD license. It is
+  header-only and compiled into xtax in all builds.
