@@ -1,4 +1,3 @@
-#include <mdspan>
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -6,6 +5,7 @@
 #include <iostream>
 #include <mutex>
 #include <random>
+#include <span>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -16,8 +16,6 @@
 
 #include "CLI11.hpp"
 
-using mdspan2d = std::mdspan<int64_t, std::extents<size_t, std::dynamic_extent, std::dynamic_extent>, std::layout_right>;
-
 constexpr int64_t MAGNITUDE_LIMIT = 1ll << 48;
 
 struct Matrix {
@@ -26,19 +24,18 @@ struct Matrix {
 
     Matrix() = default;
     Matrix(size_t n_) : n(n_), data(n_* n_, 0) {}
-    mdspan2d view() { return mdspan2d(data.data(), (size_t)n, (size_t)n); }
-    mdspan2d view() const { return mdspan2d(const_cast<int64_t*>(data.data()), (size_t)n, (size_t)n); }
+    int64_t* buf() { return data.data(); }
     void fill_identity() {
         std::fill(data.begin(), data.end(), 0);
-        for (int i = 0; i < n; ++i) data[(size_t)i * n + i] = 1;
+        for (int i = 0; ((size_t)i) < n; ++i) data[(size_t)i * n + i] = 1;
     }
     inline int64_t& at(int i, int j) { return data[(size_t)i * n + j]; }
     inline const int64_t& at(int i, int j) const { return data[(size_t)i * n + j]; }
 
     void print() const
     {
-        for (int i = 0; i < n; ++i) {
-            for (int j = 0; j < n; ++j) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = 0; j < n; ++j) {
                 std::cout << at(i, j);
                 if (j + 1 < n) std::cout << ',';
             }
@@ -47,24 +44,22 @@ struct Matrix {
     }
 
     bool is_diagonal() const {
-        auto A = this->view();
-        for (int i = 0; i < n; ++i) {
-            for (int j = 0; j < n; ++j) {
-                if (i != j && A[i, j] != 0) return false;
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = 0; j < n; ++j) {
+                if (i != j && at(i, j) != 0) return false;
             }
         }
         return true;
     }
 
     double score() const {
-        auto A = this->view();
         double full_sum = 0;
         for (const auto e : data) {
             full_sum += std::llabs(e);
         }
 
         double diag_sum = 0;
-        for (int i = 0; i < n; ++i) {
+        for (size_t i = 0; i < n; ++i) {
             diag_sum += std::llabs(data[i*n+i]);
         }
 
@@ -74,7 +69,7 @@ struct Matrix {
     bool is_within_magnitude_limit(int64_t limit) {
         for (size_t i = 0; i < n; ++i) {
             for (size_t j = 0; j < n; ++j) {
-                const int64_t e = this->at(i, j);
+                const int64_t e = at(i, j);
                 if (e > limit || e < -limit) {
                     return false;
                 }
@@ -85,68 +80,67 @@ struct Matrix {
 };
 
 
-enum class TType { Add, Swap, Neg, LongShear };
+enum class TType { Add, Swap, Neg };
 struct Trans { TType type; int i, j; int s; };
 
 void apply_to_X(Matrix& X, const Trans& t) {
-    int n = X.n;
+    const size_t n = X.n;
 
     if (t.type == TType::Add) {
-        for (int r = 0; r < n; ++r)
+        for (size_t r = 0; r < n; ++r)
             X.at(r, t.j) += (int64_t)t.s * X.at(r, t.i);
     }
     else if (t.type == TType::Swap) {
-        for (int r = 0; r < n; ++r)
+        for (size_t r = 0; r < n; ++r)
             std::swap(X.at(r, t.i), X.at(r, t.j));
     }
     else {
-        for (int r = 0; r < n; ++r)
+        for (size_t r = 0; r < n; ++r)
             X.at(r, t.i) = -X.at(r, t.i);
     }
 }
 
 
 void apply_to_A(Matrix& mtx, const Trans& t) {
-    mdspan2d A = mtx.view();
-    const int n = mtx.n;
+    const size_t n = mtx.n;
 
     switch (t.type) {
         case TType::Neg: {
             int i = t.i;
-            for (int k = 0; k < n; ++k) {
-                A[i, k] = -A[i, k];
-                A[k, i] = -A[k, i];
+            for (size_t k = 0; k < n; ++k) {
+                mtx.at(i, k) = -mtx.at(i, k);
+                mtx.at(k, i) = -mtx.at(k, i);
             }
             break;
         }
         case TType::Swap: {
             int a = t.i, b = t.j;
-            for (int k = 0; k < n; ++k) {
-                if (k != a && k != b) {
-                    std::swap(A[a, k], A[b, k]);
-                    std::swap(A[k, a], A[k, b]);
+            for (size_t k = 0; k < n; ++k) {
+                if (k != (size_t)a && k != (size_t)b) {
+                    std::swap(mtx.at(a, k), mtx.at(b, k));
+                    std::swap(mtx.at(k, a), mtx.at(k, b));
                 }
             }
-            std::swap(A[a, a], A[b, b]);
-            std::swap(A[a, b], A[b, a]);
+            std::swap(mtx.at(a, a), mtx.at(b, b));
+            std::swap(mtx.at(a, b), mtx.at(b, a));
             break;
         }
         case TType::Add: {
             int i = t.i, j = t.j, s = t.s;
-            for (int k = 0; k < n; ++k) {
-                if (k != i && k != j) {
-                    int64_t v = A[j, k] + (int64_t)s * A[i, k];
-                    A[j, k] = v;
-                    A[k, j] = v;
+            for (size_t k = 0; k < n; ++k) {
+                if (k != (size_t)i && k != (size_t)j) {
+                    int64_t v = mtx.at(j, k) + (int64_t)s * mtx.at(i, k);
+                    mtx.at(j, k) = v;
+                    mtx.at(k, j) = v;
                 }
             }
-            int64_t a_ji = A[j, i] + (int64_t)s * A[i, i];
-            A[j, i] = a_ji;
-            A[i, j] = a_ji;
+            int64_t a_ji = mtx.at(j, i) + (int64_t)s * mtx.at(i, i);
+            mtx.at(j, i) = a_ji;
+            mtx.at(i, j) = a_ji;
 
             // new_jj = old_jj + 2*s*old_ji + s*s*old_ii
             // expressed with a_ji (new_ji): new_jj = old_jj + 2*s*new_ji - s*s*old_ii
-            A[j, j] += (int64_t)2 * s * A[j, i] - (int64_t)s * s * A[i, i];
+            mtx.at(j, j) += (int64_t)2 * s * mtx.at(j, i) - (int64_t)s * s * mtx.at(i, i);
             break;
         }
     }
@@ -406,9 +400,7 @@ int main(int argc, char** argv) {
     for (auto& th : threads) th.join();
 
     std::cout << "Final best score: " << global_best.score << "\n";
-    if (n <= 20)
-    {
-        auto Av = global_best.A.view();
+    if (n <= 20) {
         std::cout << "A:\n";
         global_best.A.print();
         std::cout << "----\nX:\n";
