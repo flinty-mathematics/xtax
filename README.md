@@ -1,5 +1,6 @@
 # XTAX
-A CPU parallel 'random congruence annealer' for solving the integer matrix problem $X^\top A X = B$ with $B$ diagonal. 
+A CPU parallel 'random congruence annealer' for solving the integer matrix problem $X^\top A X = B$ with $B$ diagonal
+and where $A$ is a unimodular symmetric matrix (not necessarially definite)
 
 See here: https://mathematica.stackexchange.com/a/314866/72682
 
