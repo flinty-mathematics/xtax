@@ -5,14 +5,9 @@
 #include <iostream>
 #include <mutex>
 #include <random>
-#include <span>
-#include <sstream>
-#include <string>
 #include <thread>
 #include <vector>
 #include <condition_variable>
-
-#include <immintrin.h>
 
 #include "CLI11.hpp"
 
