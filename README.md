@@ -253,7 +253,7 @@ the same congruence move it keeps:
 
 and minimizes the combined squared-Frobenius off-diagonal score
 
-$$F(X) = \lVert \operatorname{offdiag}(P) \rVert_F^2 + c \cdot \lVert \operatorname{offdiag}(Q) \rVert_F^2,$$
+$$F(X) = \lVert \text{offdiag}(P) \rVert_F^2 + c \cdot \lVert \text{offdiag}(Q) \rVert_F^2,$$
 
 so a low score means both the basis and its dual basis are close to
 orthogonal. The move $P \to E^\top P E$ (for a unimodular $E$) sends
@@ -302,7 +302,7 @@ matrix mode. Writes `final_L.csv` (the final basis $X^\top L$) in addition to
 For small matrices ($n \le 20$) the final $P$, $Q$, and $X$ (or $L$) are also
 printed to stdout. Progress is logged as `[t=...s] new best score=... primal=...
 dual=... (thread k)` lines, where `primal` is the number of nonzero primal
-off-diagonal pairs and `dual` is $\lVert \operatorname{offdiag}(Q) \rVert_F$.
+off-diagonal pairs and `dual` is $\lVert \text{offdiag}(Q) \rVert_F$.
 
 ### Options
 
@@ -318,7 +318,7 @@ the options specific to the primal/dual objective are:
 | `-t, --threads <int>` | physical cores | Number of worker threads (see `--use-hyperthreads`). |
 | `--use-hyperthreads` | off | Default the worker count to all logical processors instead of physical cores (ignored if `--threads` is given). |
 | `--no-pin` | off | Do not pin worker threads to physical cores (Windows; pinning is on by default). |
-| `--lambda <float>` | `1.0` | Dual weight $c$ in $F = \lVert \operatorname{offdiag}(P) \rVert_F^2 + c \lVert \operatorname{offdiag}(Q) \rVert_F^2$, where `1.0` gives equal initial primal/dual weight. |
+| `--lambda <float>` | `1.0` | Dual weight $c$ in $F = \lVert \text{offdiag}(P) \rVert_F^2 + c \lVert \text{offdiag}(Q) \rVert_F^2$, where `1.0` gives equal initial primal/dual weight. |
 | `--dual-refresh <int>` | `200000` | Moves between unconditional exact re-inversions of the dual (`0` = never). |
 | `--dual-check <int>` | `25000` | Moves between sampled dual residual checks that can trigger an early re-inversion (`0` = never). |
 | `--dual-tol <float>` | `1e-6` | Sampled residual of $PQ - I$ that triggers an early dual re-inversion. |
