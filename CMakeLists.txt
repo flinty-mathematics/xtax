@@ -10,39 +10,108 @@ find_package(Threads REQUIRED)
 add_subdirectory(CLI11)
 
 add_executable(xtax src/main.cpp)
-target_link_libraries(xtax PRIVATE Threads::Threads CLI11)
-target_compile_features(xtax PRIVATE cxx_std_20)
+add_executable(xbkz src/bkz_main.cpp)
+if (WIN32)
+  target_sources(xbkz PRIVATE src/xbkz_ui_win32.cpp)
+  target_link_libraries(xbkz PRIVATE comctl32)
+endif()
+add_executable(xdual src/xdual_main.cpp)
 
-# ---- Compiler / platform specifics (no user-configurable options) ----
+# All programs share the same dependencies, language level, and build flags.
+set(XTAX_TARGETS xtax xbkz xdual)
+
+foreach(tgt IN LISTS XTAX_TARGETS)
+  target_link_libraries(${tgt} PRIVATE Threads::Threads CLI11)
+  target_compile_features(${tgt} PRIVATE cxx_std_20)
+endforeach()
+
+# ---- Optional AVX-512 build path ----
+# Opt in with -DXTAX_AVX512=ON to compile the SIMD reductions for AVX-512
+# (8-wide __m512d). Default OFF, which keeps the AVX2 code path. This path may
+# downclock on some CPUs and its wider summation order can differ in the last
+# ULP from the AVX2/scalar paths; cross-platform bit-for-bit determinism is only
+# a nice-to-have on this fast path, so that difference is accepted.
+option(XTAX_AVX512 "Build the SIMD reductions with AVX-512 (opt-in; may downclock and differ in the last ULP)" OFF)
+
+# ---- Compiler / platform specifics ----
 if (MSVC)
-  target_compile_options(xtax PRIVATE
-    /JMC-              # Disable JustMyCode debugging
-    /options:strict
-    /MP
-    /W4
-    /bigobj
-    /GF
-    $<$<CONFIG:Release>:/O2 /Oi /Ot /Ob3 /GS- /arch:AVX2>
-  )
-  target_compile_definitions(xtax PRIVATE
-    _CRT_SECURE_NO_WARNINGS=1
-  )
-  # Static runtime, RTTI off in Release for a leaner standalone binary.
-  target_compile_options(xtax PRIVATE $<$<CONFIG:Release>:/GR->)
-  target_compile_definitions(xtax PRIVATE $<$<CONFIG:Release>:_HAS_STATIC_RTTI=0>)
-  set_property(TARGET xtax PROPERTY
-    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  include(CheckCXXCompilerFlag)
+  if (XTAX_AVX512)
+    set(XTAX_MSVC_ARCH /arch:AVX512)
+  else()
+    set(XTAX_MSVC_ARCH /arch:AVX2)
+  endif()
+  foreach(tgt IN LISTS XTAX_TARGETS)
+    target_compile_options(${tgt} PRIVATE
+      /JMC-              # Disable JustMyCode debugging
+      /options:strict
+      /MP
+      /W4
+      /bigobj
+      /GF
+      # /GL enables whole-program optimization; it pairs with /LTCG at link.
+      $<$<CONFIG:Release>:/O2 /Oi /Ot /Ob3 /GS- /GL ${XTAX_MSVC_ARCH}>
+    )
+    target_link_options(${tgt} PRIVATE $<$<CONFIG:Release>:/LTCG>)
+    target_compile_definitions(${tgt} PRIVATE
+      _CRT_SECURE_NO_WARNINGS=1
+    )
+    # Static runtime, RTTI off in Release for a leaner standalone binary.
+    target_compile_options(${tgt} PRIVATE $<$<CONFIG:Release>:/GR->)
+    target_compile_definitions(${tgt} PRIVATE $<$<CONFIG:Release>:_HAS_STATIC_RTTI=0>)
+    set_property(TARGET ${tgt} PROPERTY
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  endforeach()
 else()
   # GCC/Clang (Linux, macOS, etc.)
-  target_compile_options(xtax PRIVATE
-    -Wall -Wextra -Wpedantic
-    $<$<CONFIG:Release>:-O3 -fno-stack-protector -fno-rtti>
-  )
-
-  # Enable AVX2 in Release when the compiler supports the flag
   include(CheckCXXCompilerFlag)
   check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-  if (COMPILER_SUPPORTS_AVX2)
-    target_compile_options(xtax PRIVATE $<$<CONFIG:Release>:-mavx2>)
+  if (XTAX_AVX512)
+    check_cxx_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512F)
+    check_cxx_compiler_flag("-mavx512vl" COMPILER_SUPPORTS_AVX512VL)
   endif()
+  foreach(tgt IN LISTS XTAX_TARGETS)
+    target_compile_options(${tgt} PRIVATE
+      -Wall -Wextra -Wpedantic
+      $<$<CONFIG:Release>:-O3 -fno-stack-protector -fno-rtti>
+    )
+    if (XTAX_AVX512 AND COMPILER_SUPPORTS_AVX512F)
+      target_compile_options(${tgt} PRIVATE $<$<CONFIG:Release>:-mavx512f>)
+      if (COMPILER_SUPPORTS_AVX512VL)
+        target_compile_options(${tgt} PRIVATE $<$<CONFIG:Release>:-mavx512vl>)
+      endif()
+    elseif (COMPILER_SUPPORTS_AVX2)
+      target_compile_options(${tgt} PRIVATE $<$<CONFIG:Release>:-mavx2>)
+    endif()
+    # Link-time optimization (the GCC/Clang analogue of MSVC /GL + /LTCG).
+    target_compile_options(${tgt} PRIVATE $<$<CONFIG:Release>:-flto>)
+    target_link_options(${tgt} PRIVATE $<$<CONFIG:Release>:-flto>)
+  endforeach()
+endif()
+
+if (XTAX_AVX512)
+  message(STATUS "xtax: AVX-512 SIMD path ENABLED (opt-in; may differ in the last ULP)")
+else()
+  message(STATUS "xtax: AVX-512 SIMD path disabled (set -DXTAX_AVX512=ON to enable; default AVX2)")
+endif()
+
+# ---- Optional fast floating point for the FP-heavy reducer / dual paths ----
+# Opt in with -DXTAX_FAST_MATH=ON. This lets the compiler reassociate and use
+# FMA in the hot floating-point loops, which is faster but breaks the strict,
+# portable rounding the default build guarantees (results may differ in the last
+# ULP and are no longer bit-for-bit reproducible across builds). Default OFF.
+# Applied to xbkz (the reduction core) and xdual (its double-precision dual
+# maintenance and Frobenius reductions).
+option(XTAX_FAST_MATH "Compile the xbkz reducer and xdual dual loops with fast floating point (opt-in; breaks strict determinism)" OFF)
+if (XTAX_FAST_MATH)
+  if (MSVC)
+    target_compile_options(xbkz PRIVATE $<$<CONFIG:Release>:/fp:fast>)
+    target_compile_options(xdual PRIVATE $<$<CONFIG:Release>:/fp:fast>)
+  else()
+    target_compile_options(xbkz PRIVATE $<$<CONFIG:Release>:-ffast-math>)
+    target_compile_options(xdual PRIVATE $<$<CONFIG:Release>:-ffast-math>)
+  endif()
+  message(STATUS "xbkz/xdual: fast floating point ENABLED (opt-in; last-ULP/determinism differences)")
+else()
+  message(STATUS "xbkz/xdual: fast floating point disabled (set -DXTAX_FAST_MATH=ON to enable)")
 endif()
