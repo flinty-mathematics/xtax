@@ -241,7 +241,10 @@ static void refresh_ui(UiState* ui) {
 
     wchar_t buf[512];
     if (ui->best->has_relaxed.load(std::memory_order_acquire)) {
-        const double b0 = ui->best->b0_relaxed.load(std::memory_order_relaxed);
+        // The monotone best-vector record, not the best basis's shortest row:
+        // the two differ when a short input row was lost by the initial LLL.
+        const double b0 =
+            ui->best->vec_norm2_relaxed.load(std::memory_order_relaxed);
         const double norm = std::sqrt(b0);
         std::swprintf(buf, 512, L"Best shortest norm: %s   (norm\u00B2 = %s)",
                       fmt_double(norm, 8).c_str(), fmt_double(b0, 6).c_str());

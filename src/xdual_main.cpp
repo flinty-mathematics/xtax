@@ -374,8 +374,10 @@ struct Params {
 
 // Build the initial primal/dual state (inverting the Gram once) and run the
 // shared engine on it until the primal is diagonal or the budget elapses.
+// rows, when non-null, restricts the engine's moves to those indices.
 static DualObjective run_xdual(const Matrix& P_init, const Matrix& X_start,
-                               const Params& params) {
+                               const Params& params,
+                               const std::vector<int>* rows) {
     Matrixd Q_init;
     std::cout << "[xdual] inverting the Gram (double-precision dual P^-1)...\n";
     if (!invert_to(P_init, Q_init)) {
@@ -409,7 +411,7 @@ static DualObjective run_xdual(const Matrix& P_init, const Matrix& X_start,
               << " primal=" << start.offdiag_nonzero()
               << " dual=" << std::sqrt((double)s_q0) << "\n";
 
-    DualObjective best = canneal::run_annealer(start, params.engine);
+    DualObjective best = canneal::run_annealer(start, params.engine, rows);
     if (params.lambda_ramp > 0.0) {
         // The global best may have been recorded while the dual weight was
         // still ramping. Re-base its score at the full weight so the final
@@ -429,6 +431,8 @@ int main(int argc, char** argv) {
     std::string a_csv;
     std::string l_csv;
     std::string x_csv;
+    std::string gram_rows_spec;  // --gram-rows: restrict moves to these rows
+    uint64_t modulus = 0;   // 0 = off; 1 = saturation; > 1 = balanced mod
     Params params;
 
     const int physical = canneal::physical_core_count();
@@ -441,6 +445,16 @@ int main(int argc, char** argv) {
     app.add_option("-A", a_csv, "CSV file for a symmetric matrix A (n x n integers), used as the primal working Gram");
     app.add_option("-L,--lattice", l_csv, "CSV file for a lattice basis (rows are vectors). Anneals the Gram G = L*L^T and its dual");
     app.add_option("-X", x_csv, "Path to initial X matrix (A mode). If none, start from identity");
+    app.add_option("--modulus", modulus,
+                   "Reduce the loaded input entries (A or L) modulo this value once at load, "
+                   "to balanced residues in (-m/2, m/2]. A modulus of 1 selects saturation "
+                   "instead: nonzero entries become 1, 0 stays 0")
+        ->check(CLI::Range((uint64_t)1, (uint64_t)INT64_MAX));
+    app.add_option("--gram-rows", gram_rows_spec,
+                   "Restrict the annealer's moves to these 0-based row indices of the "
+                   "working matrix: a comma-separated list of indices and inclusive "
+                   "lo..hi ranges, e.g. \"0,3..6,9\". Rows outside the set are never "
+                   "used as pivot or target. Default: all rows");
     app.add_option("--lambda", params.lambda, "Dual weight in F = offdiag(P)^2 + c*offdiag(Q)^2, where 1.0 gives equal initial primal/dual weight");
     threads_opt = app.add_option("-t,--threads", params.engine.threads, "Number of worker threads (default: physical core count)");
     app.add_flag("--use-hyperthreads", use_hyperthreads, "Default the worker count to all logical processors instead of physical cores (ignored if --threads is given)");
@@ -498,14 +512,34 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        if (modulus > 0) {
+            reduce_entries_mod(A.data, modulus);
+            std::cout << "[modulus] " << modulus_note(modulus) << "\n";
+        }
+
         const int n = (int)A.n;
+        std::vector<int> rows;
+        if (!gram_rows_spec.empty()) {
+            try {
+                rows = parse_index_spec(gram_rows_spec, n, "--gram-rows");
+                if (rows.size() < 2)
+                    throw std::runtime_error(
+                        "--gram-rows: need at least 2 rows (a move uses a "
+                        "pivot and a target)");
+            } catch (const std::exception& e) {
+                std::cerr << "Error: " << e.what() << "\n";
+                return 1;
+            }
+            std::cout << "[gram-rows] restricting moves to " << rows.size()
+                      << " of " << n << " rows\n";
+        }
         // With a supplied initial transform the working Gram starts at
         // X^T A X, so the search continues where the previous run stopped and
         // the output invariant X^T A X == best_P holds against the input A.
         const Matrix A_work = x_csv.empty() ? A : congruence_of(A, X);
         DualObjective best;
         try {
-            best = run_xdual(A_work, X, params);
+            best = run_xdual(A_work, X, params, rows.empty() ? nullptr : &rows);
         } catch (const std::exception& e) {
             std::cerr << "Error: " << e.what() << "\n";
             return 1;
@@ -546,14 +580,45 @@ int main(int argc, char** argv) {
                   << d << "); the basis is linearly dependent and the Gram matrix is singular\n";
     }
 
+    if (modulus > 0) {
+        reduce_entries_mod(curL.data, modulus);
+        std::cout << "[modulus] " << modulus_note(modulus) << "\n";
+        for (int i = 0; i < m; ++i) {
+            const int64_t* ri = curL.row(i);
+            bool zero = true;
+            for (int k = 0; k < d; ++k) if (ri[k] != 0) { zero = false; break; }
+            if (zero) {
+                std::cerr << "Warning: row " << i << " became zero under the "
+                          << "modulus; the Gram matrix is singular and the dual "
+                          << "inversion will fail\n";
+            }
+        }
+    }
+
     Matrix G = gram_of(curL);
     std::cout << "[lattice] m=" << m << " d=" << d << "\n";
+
+    std::vector<int> rows;
+    if (!gram_rows_spec.empty()) {
+        try {
+            rows = parse_index_spec(gram_rows_spec, m, "--gram-rows");
+            if (rows.size() < 2)
+                throw std::runtime_error(
+                    "--gram-rows: need at least 2 rows (a move uses a pivot "
+                    "and a target)");
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << "\n";
+            return 1;
+        }
+        std::cout << "[gram-rows] restricting moves to " << rows.size()
+                  << " of " << m << " rows\n";
+    }
 
     Matrix I((size_t)m);
     I.fill_identity();
     DualObjective gb;
     try {
-        gb = run_xdual(G, I, params);
+        gb = run_xdual(G, I, params, rows.empty() ? nullptr : &rows);
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;

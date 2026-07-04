@@ -131,6 +131,25 @@ Lattice mode writes to the current directory:
 - `best_A.csv`: its Gram matrix (the annealed $X^\top A X$).
 - `best_X.csv`: the transform $X$ relating the input basis to `final_L`.
 
+### Restricting the Gram metric
+
+In lattice mode, `--lattice-dims <spec>` changes how the initial Gram is
+computed: only the listed 0-based columns (dimensions) of $L$ enter the dot
+products, as if all other columns had been discarded. The spec uses the same
+syntax as `--gram-rows` (comma-separated indices and inclusive `lo..hi`
+ranges). The Gram stays $m \times m$ and symmetric; only its numbers change,
+so this is a change of metric, not a restriction of the annealer's moves
+(that is what `--gram-rows` is for, and the two compose). The lattice itself
+is never modified: the restricted copy exists only for the one-time Gram
+calculation, and when the run ends the accumulated unimodular transform is
+applied to the full original lattice as usual.
+
+This lets you improve orthogonality or sparsity in a few chosen dimensions,
+at the accepted risk of blowing up the basis in the unselected ones. Note
+that with fewer selected dimensions than basis vectors the restricted Gram
+is singular, and `best_A.csv` holds the annealed *restricted* Gram; the full
+Gram is recoverable from `final_L.csv`.
+
 ### Options
 
 Exactly one of `-A` or `-L` must be given.
@@ -140,6 +159,9 @@ Exactly one of `-A` or `-L` must be given.
 | `-A <file>` | (one required) | CSV file for $A$ ($n \times n$ integers). |
 | `-L, --lattice <file>` | (one required) | CSV lattice basis (rows are vectors). Anneals the Gram $A = L L^\top$. |
 | `-X <file>` | identity | Initial $X$ to continue from (matrix mode). |
+| `--modulus <uint>` | off | Reduce the loaded input entries ($A$ or $L$) modulo this value once at load (see [Input modulus](#input-modulus)). |
+| `--gram-rows <spec>` | all rows | Restrict moves to these 0-based row indices of the working matrix: a comma-separated list of indices and inclusive `lo..hi` ranges, e.g. `0,3..6,9`. Rows outside the set are never used as pivot or target. Not combinable with `--deflate`, `--deflate-blocks`, `--rcm`, or `--centroid`. |
+| `--lattice-dims <spec>` | all dims | Lattice mode only: build the initial Gram from these 0-based lattice columns (dimensions) only, same list syntax as `--gram-rows` (see [Restricting the Gram metric](#restricting-the-gram-metric)). |
 | `-t, --threads <int>` | physical cores | Number of worker threads (see `--use-hyperthreads`). |
 | `--use-hyperthreads` | off | Default the worker count to all logical processors instead of physical cores (ignored if `--threads` is given). |
 | `--no-pin` | off | Do not pin worker threads to physical cores (Windows; pinning is on by default). |
@@ -315,6 +337,8 @@ the options specific to the primal/dual objective are:
 | `-A <file>` | (one required) | CSV file for a symmetric matrix $A$ ($n \times n$ integers), used as the primal working Gram. |
 | `-L, --lattice <file>` | (one required) | CSV lattice basis (rows are vectors). Anneals the Gram $G = L L^\top$ and its dual. |
 | `-X <file>` | identity | Initial $X$ to continue from (matrix mode). |
+| `--modulus <uint>` | off | Reduce the loaded input entries ($A$ or $L$) modulo this value once at load (see [Input modulus](#input-modulus)). |
+| `--gram-rows <spec>` | all rows | Restrict moves to these 0-based row indices of the working matrix: a comma-separated list of indices and inclusive `lo..hi` ranges, e.g. `0,3..6,9`. Rows outside the set are never used as pivot or target. |
 | `-t, --threads <int>` | physical cores | Number of worker threads (see `--use-hyperthreads`). |
 | `--use-hyperthreads` | off | Default the worker count to all logical processors instead of physical cores (ignored if `--threads` is given). |
 | `--no-pin` | off | Do not pin worker threads to physical cores (Windows; pinning is on by default). |
@@ -396,7 +420,11 @@ writes to the current directory (or wherever `-o` / `--transform-out` /
 - `reduced.csv`: the reduced basis.
 - `U.csv`: the unimodular transform ($\text{reduced} = U \cdot L$), unless
   `--no-transform` is given.
-- `shortest.csv`: the single shortest row of the reduced basis.
+- `shortest.csv`: the single shortest vector found. This is normally the
+  shortest row of the reduced basis, but it is tracked separately and never
+  gets longer: if the input basis contained a shorter row than any reduced
+  basis achieved (the initial LLL orders rows by projected norm and can
+  legitimately lose a short row), that row is preserved and written instead.
 
 On Windows a live progress window shows each worker's phase, tour, current
 block size, and enumeration/sieve progress; `--no-gui` disables it. Elsewhere
@@ -407,9 +435,10 @@ block size, and enumeration/sieve progress; `--no-gui` disables it. Elsewhere
 | Option | Default | Description |
 |---|---|---|
 | `-L, --lattice <file>` | (required) | CSV lattice basis to reduce (rows are vectors). |
+| `--modulus <uint>` | off | Reduce the loaded basis entries modulo this value once at load (see [Input modulus](#input-modulus)). Note the reduced basis spans a different lattice unless the original is $m$-ary; all outputs refer to the reduced input. |
 | `-o, --out <file>` | `reduced.csv` | Output CSV for the reduced basis. |
 | `--transform-out <file>` | `U.csv` | Output CSV for the unimodular transform $U$ (reduced = $U \cdot L$). |
-| `--shortest-out <file>` | `shortest.csv` | Output CSV for the shortest vector (first reduced row). |
+| `--shortest-out <file>` | `shortest.csv` | Output CSV for the shortest vector found (usually a row of the reduced basis, kept separately when it is shorter than every reduced row). |
 | `--no-transform` | off | Do not track or write the transform $U$ (saves memory and time; recommended for large $n$, where each worker otherwise holds a full $n \times n$ transform in addition to its basis and Gram data). |
 | `-t, --threads <int>` | physical cores | Number of worker threads (default: physical core count). |
 | `--use-hyperthreads` | off | Default the worker count to all logical processors instead of physical cores (ignored if `--threads` is given). |
@@ -430,6 +459,27 @@ block size, and enumeration/sieve progress; `--no-gui` disables it. Elsewhere
 | `--seed <int>` | random | Base RNG seed. |
 | `--no-init-lll` | off | Skip the shared initial LLL pass (use when the input is already reduced). Perturbation shears still run, but their follow-up LLL is skipped so workers diversify without re-reducing. |
 | `--no-gui` | off | Run without the Win32 progress window (Windows only). |
+
+## Input modulus
+
+All three tools accept `--modulus <uint>` (> 0). It reduces the entries of the
+loaded input (the `-A` matrix or the `-L` basis) exactly once, at load time, so
+it costs a single pass over the input and adds nothing to the hot paths.
+
+- **`--modulus m` with `m > 1`**: every entry is replaced by its balanced
+  (least absolute) residue in $(-m/2,\, m/2]$, which keeps magnitudes as small
+  as possible.
+- **`--modulus 1` (saturation mode)**: plain mod 1 would zero everything, so a
+  modulus of 1 instead saturates the entries: every nonzero entry (positive or
+  negative) becomes `1`, and `0` stays `0`.
+
+The reduction changes the input itself: the tools then operate on, and their
+output invariants (`reduced = U * L`, $X^\top A X$ = best working matrix) hold
+against, the *reduced* input. For `xbkz` in particular the reduced basis spans
+a different lattice than the raw input unless the lattice is $m$-ary. A row
+that becomes all zeros under the modulus is rejected by `xbkz` (the basis is no
+longer full rank) and warned about by `xtax` / `xdual` (the Gram turns
+singular).
 
 ## Shared machinery
 

@@ -1254,8 +1254,22 @@ static bool better(real_t b0, real_t pot,
     return pot < cur_pot;
 }
 
+// Record v (squared norm norm2) as the shortest lattice vector ever seen, if
+// it beats the current record. The record is monotone: it starts at the
+// shortest input row and only ever gets strictly shorter, so the reported
+// best norm never increases even when a reduced basis's shortest row is
+// longer than a short input row that LLL did not keep. Caller holds best.mtx.
+static void offer_best_vector_locked(GlobalBest& best, const int64_t* v, int d,
+                                     real_t norm2) {
+    if (!best.vec.empty() && (double)norm2 >= best.vec_norm2) return;
+    best.vec.assign(v, v + d);
+    best.vec_norm2 = (double)norm2;
+    best.vec_norm2_relaxed.store((double)norm2, std::memory_order_relaxed);
+}
+
 static bool promote(Reducer& local, GlobalBest& best) {
-    real_t b0 = local.shortest_norm2();
+    int b0_idx = 0;
+    real_t b0 = local.shortest_norm2(&b0_idx);
     // Cheap lock-free reject: only a strictly shorter vector is worth promoting,
     // so skip the lock and the copy when this result cannot beat the current b0.
     if (best.has_relaxed.load(std::memory_order_acquire)) {
@@ -1270,6 +1284,7 @@ static bool promote(Reducer& local, GlobalBest& best) {
     std::vector<int64_t> u_copy;
     if (local.track_u) u_copy = local.U;
     std::lock_guard<std::mutex> lk(best.mtx);
+    offer_best_vector_locked(best, local.b_row(b0_idx), local.d, b0);
     if (!best.has || better(b0, pot, best.b0, best.pot)) {
         best.B.swap(b_copy);
         if (local.track_u) best.U.swap(u_copy);
@@ -1314,9 +1329,11 @@ static bool reseed_from_best(Reducer& local, GlobalBest& best) {
 // Install a reducer's basis as the initial global best (not counted as a BKZ
 // improvement). Called once in main after the shared initial LLL pass.
 static void seed_global_best(const Reducer& red, GlobalBest& best) {
-    const real_t b0 = red.shortest_norm2();
+    int b0_idx = 0;
+    const real_t b0 = red.shortest_norm2(&b0_idx);
     const real_t pot = red.potential();
     std::lock_guard<std::mutex> lk(best.mtx);
+    offer_best_vector_locked(best, red.b_row(b0_idx), red.d, b0);
     best.B = red.B;
     if (red.track_u) best.U = red.U;
     best.n = red.n;
@@ -1362,6 +1379,16 @@ static bool prepare_starting_basis(const Lattice& L0, const RunParams& p,
     red.delta = p.delta;
     red.build_gram();
     red.compute_gso();
+    // Record the shortest input row before reducing. LLL orders rows by
+    // projected norm, so it can legitimately lose a short input row whose
+    // projection is tiny; this keeps that row as the best vector seen so the
+    // reported best never starts worse than the input.
+    {
+        int in_idx = 0;
+        real_t in_short = red.shortest_norm2(&in_idx);
+        std::lock_guard<std::mutex> lk(best.mtx);
+        offer_best_vector_locked(best, red.b_row(in_idx), red.d, in_short);
+    }
     if (!p.no_init_lll) {
         red.save_state();
         try {
@@ -1458,7 +1485,7 @@ static void worker(int id, const Lattice& L0, RunParams p, GlobalBest& best,
         // Progressive schedule: start small (diversified per worker) and ramp
         // beta up over tours so each larger-beta search is preprocessed by the
         // earlier smaller-beta reductions. Without --progressive, fall back to
-        // the previous random-beta-per-tour behaviour.
+        // the random-beta-per-tour behaviour.
         int beta = p.progressive ? progressive_start()
                                   : random_beta(rng, min_beta, max_beta);
         real_t local_b0 = refresh_local_b0();
@@ -1650,14 +1677,26 @@ int main(int argc, char** argv) {
     bool no_gui = false;
     bool no_progressive = false;
     uint64_t seed = std::random_device{}();
+    uint64_t modulus = 0;   // 0 = off; 1 = saturation; > 1 = balanced mod
 
     app.add_option("-L,--lattice", l_csv,
                    "CSV lattice basis to reduce (rows are vectors)")->required();
+    app.add_option("--modulus", modulus,
+                   "Reduce the loaded basis entries modulo this value once at "
+                   "load, to balanced residues in (-m/2, m/2]. A modulus of 1 "
+                   "selects saturation instead: nonzero entries become 1, 0 "
+                   "stays 0. Note the reduced basis spans a different lattice "
+                   "unless the original is m-ary; outputs refer to the reduced "
+                   "input")
+        ->check(CLI::Range((uint64_t)1, (uint64_t)INT64_MAX));
     app.add_option("-o,--out", out_csv, "Output CSV for the reduced basis");
     app.add_option("--transform-out", u_csv,
                    "Output CSV for the unimodular transform U (reduced = U * L)");
     app.add_option("--shortest-out", short_csv,
-                   "Output CSV for the shortest vector (first reduced row)");
+                   "Output CSV for the shortest vector found. Usually a row of "
+                   "the reduced basis, but kept separately when it is shorter "
+                   "than every reduced row (e.g. a short input row the initial "
+                   "LLL did not preserve)");
     app.add_flag("--no-transform", no_transform,
                  "Do not track or write the transform U. Saves memory and time, "
                  "recommended for large n, where each worker otherwise holds a "
@@ -1684,7 +1723,7 @@ int main(int argc, char** argv) {
                    "Maximum Schnorr-Euchner nodes per block (0 = unlimited)");
     app.add_flag("--no-progressive", no_progressive,
                  "Disable the per-worker progressive beta schedule and pick a "
-                 "random block size per tour instead (the previous behaviour)");
+                 "random block size per tour instead");
     app.add_option("--preprocess-beta", p.preprocess_beta,
                    "Local block preprocessing block size before each full "
                    "enumeration (0 = off). A cheap smaller-beta pass that shrinks "
@@ -1785,6 +1824,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (modulus > 0) {
+        reduce_entries_mod(L0.data, modulus);
+        std::cout << "[xbkz] " << modulus_note(modulus) << "\n";
+        // A zero row cannot be part of a basis and would degenerate the GSO,
+        // so reject it up front (rows that merely become dependent are caught
+        // later by the reduction blowing up, not here).
+        for (int i = 0; i < L0.m; ++i) {
+            const int64_t* ri = L0.row(i);
+            bool zero = true;
+            for (int k = 0; k < L0.d; ++k) if (ri[k] != 0) { zero = false; break; }
+            if (zero) {
+                std::cerr << "error: row " << i << " became zero under "
+                          << "--modulus " << modulus
+                          << ", the reduced basis is not full rank\n";
+                return 1;
+            }
+        }
+    }
+
     real_t init_short = 0;
     {
         Reducer probe;
@@ -1844,6 +1902,16 @@ int main(int argc, char** argv) {
             std::cout << "[xbkz] after initial LLL, shortest row norm "
                       << std::sqrt((double)after)
                       << " (norm^2 = " << norm2_str(after) << ")\n";
+        // LLL orders rows by projected norm, so a short input row with a tiny
+        // projection can legitimately end up remixed into longer rows. The best
+        // vector record keeps it, so the reported best never gets worse than
+        // the input.
+        if (best.vec_norm2 < (double)after * (1.0 - 1e-12))
+            std::cout << "[xbkz] initial LLL did not keep the shortest input "
+                         "row; it stays the best vector (norm "
+                      << std::sqrt(best.vec_norm2)
+                      << ", norm^2 = " << norm2_str((real_t)best.vec_norm2)
+                      << ")\n";
     }
     std::cout.flush();
 
@@ -1911,14 +1979,27 @@ int main(int argc, char** argv) {
 
     int short_idx = 0;
     real_t final_short = flat_shortest_norm2(best.B, best.n, best.d, &short_idx);
-    std::cout << "[xbkz] best shortest vector norm " << std::sqrt((double)final_short)
-              << " (norm^2 = " << norm2_str(final_short) << ")\n";
+    // The best vector record is monotone and seeded from the input rows, so it
+    // can be shorter than any row of the best basis (see GlobalBest::vec).
+    const bool vec_beats_basis =
+        !best.vec.empty() && best.vec_norm2 < (double)final_short * (1.0 - 1e-12);
+    std::cout << "[xbkz] best shortest vector norm "
+              << std::sqrt(best.vec_norm2)
+              << " (norm^2 = " << norm2_str((real_t)best.vec_norm2) << ")\n";
+    if (vec_beats_basis)
+        std::cout << "[xbkz] note: the best vector is not a row of the best "
+                     "basis (basis shortest row norm "
+                  << std::sqrt((double)final_short)
+                  << ", norm^2 = " << norm2_str(final_short) << ")\n";
 
     try {
         write_flat_csv(best.B, best.n, best.d, out_csv);
         std::vector<std::vector<int64_t>> shortest(1);
-        shortest[0].assign(best.B.data() + (size_t)short_idx * best.d,
-                           best.B.data() + (size_t)short_idx * best.d + best.d);
+        if (vec_beats_basis)
+            shortest[0] = best.vec;
+        else
+            shortest[0].assign(best.B.data() + (size_t)short_idx * best.d,
+                               best.B.data() + (size_t)short_idx * best.d + best.d);
         write_rows_csv(shortest, short_csv);
         std::cout << "[xbkz] wrote reduced basis to " << out_csv
                   << " and shortest vector to " << short_csv << "\n";

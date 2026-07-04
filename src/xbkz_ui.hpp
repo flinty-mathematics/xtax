@@ -62,8 +62,18 @@ struct GlobalBest {
     double b0 = 0;
     double pot = 0;
     bool has = false;
+    // Shortest lattice vector ever seen, input rows included. Monotone: it is
+    // only ever replaced by a vector at least as short, so the reported best
+    // norm never increases. It equals the shortest row of B except when the
+    // input basis contained a shorter row than any reduced basis achieved
+    // (LLL orders rows by projected norm and can legitimately lose a short
+    // row whose projection is tiny). vec_norm2_relaxed mirrors vec_norm2 for
+    // lock-free readers (the UI).
+    std::vector<int64_t> vec;
+    double vec_norm2 = 0;
     std::atomic<bool> has_relaxed{ false };
     std::atomic<double> b0_relaxed{ 0.0 };
+    std::atomic<double> vec_norm2_relaxed{ 0.0 };
     std::atomic<long long> improvements{ 0 };
 };
 

@@ -563,6 +563,9 @@ int main(int argc, char** argv) {
     std::string a_csv;
     std::string l_csv;
     std::string x_csv;
+    std::string gram_rows_spec;     // --gram-rows: restrict moves to these rows
+    std::string lattice_dims_spec;  // --lattice-dims: Gram from these L columns
+    uint64_t modulus = 0;   // 0 = off; 1 = saturation; > 1 = balanced mod
     Params params;
 
     const int physical = canneal::physical_core_count();
@@ -575,6 +578,22 @@ int main(int argc, char** argv) {
     app.add_option("-A", a_csv, "CSV file for A (n x n integers)");
     app.add_option("-L,--lattice", l_csv, "CSV file for a lattice basis (rows are vectors). Anneals the Gram A = L*L^T");
     app.add_option("-X", x_csv, "Path to initial X matrix (A mode). If none, start from identity");
+    app.add_option("--modulus", modulus,
+                   "Reduce the loaded input entries (A or L) modulo this value once at load, "
+                   "to balanced residues in (-m/2, m/2]. A modulus of 1 selects saturation "
+                   "instead: nonzero entries become 1, 0 stays 0")
+        ->check(CLI::Range((uint64_t)1, (uint64_t)INT64_MAX));
+    app.add_option("--gram-rows", gram_rows_spec,
+                   "Restrict the annealer's moves to these 0-based row indices of the "
+                   "working matrix: a comma-separated list of indices and inclusive "
+                   "lo..hi ranges, e.g. \"0,3..6,9\". Rows outside the set are never "
+                   "used as pivot or target. Default: all rows");
+    app.add_option("--lattice-dims", lattice_dims_spec,
+                   "L mode only: build the initial Gram from these 0-based lattice "
+                   "columns (dimensions) only, same list syntax as --gram-rows. The "
+                   "lattice itself is untouched; only the Gram's dot products are "
+                   "restricted, and the final transform is applied to the full "
+                   "lattice as usual. Default: all dimensions");
     threads_opt = app.add_option("-t,--threads", params.engine.threads, "Number of worker threads (default: physical core count)");
     app.add_flag("--use-hyperthreads", use_hyperthreads, "Default the worker count to all logical processors instead of physical cores (ignored if --threads is given)");
     app.add_flag("--no-pin", no_pin, "Do not pin worker threads to physical cores (Windows, on by default)");
@@ -618,6 +637,26 @@ int main(int argc, char** argv) {
         std::cerr << "Error: use at most one of --deflate or --deflate-blocks\n";
         return 1;
     }
+    if (!gram_rows_spec.empty()) {
+        // Deflation manages its own active set, and its pivot-clearing step is
+        // only correct over full rows. The publish-time reorderings permute the
+        // matrix, which would silently remap the requested row indices.
+        if (params.deflate || params.deflate_blocks) {
+            std::cerr << "Error: --gram-rows cannot be combined with --deflate "
+                         "or --deflate-blocks\n";
+            return 1;
+        }
+        if (params.band_sort || params.centroid_sort) {
+            std::cerr << "Error: --gram-rows cannot be combined with --rcm or "
+                         "--centroid (reordering would remap the row indices)\n";
+            return 1;
+        }
+    }
+    if (!lattice_dims_spec.empty() && !have_L) {
+        std::cerr << "Error: --lattice-dims requires -L (it selects lattice "
+                     "columns for the Gram calculation)\n";
+        return 1;
+    }
 
     if (have_A) {
         // ----- A mode: diagonalize a given symmetric matrix -----
@@ -637,7 +676,27 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        if (modulus > 0) {
+            reduce_entries_mod(A.data, modulus);
+            std::cout << "[modulus] " << modulus_note(modulus) << "\n";
+        }
+
         const int n = (int)A.n;
+        std::vector<int> rows;
+        if (!gram_rows_spec.empty()) {
+            try {
+                rows = parse_index_spec(gram_rows_spec, n, "--gram-rows");
+                if (rows.size() < 2)
+                    throw std::runtime_error(
+                        "--gram-rows: need at least 2 rows (a move uses a "
+                        "pivot and a target)");
+            } catch (const std::exception& e) {
+                std::cerr << "Error: " << e.what() << "\n";
+                return 1;
+            }
+            std::cout << "[gram-rows] restricting moves to " << rows.size()
+                      << " of " << n << " rows\n";
+        }
         if (params.deflate) {
             std::cout << "[deflate] verifying the matrix is unimodular (det = +/-1)...\n";
             if (!is_unimodular(A)) {
@@ -655,7 +714,8 @@ int main(int argc, char** argv) {
         L1Objective global_best = any_deflate
             ? solve_with_deflation(A, params, params.deflate_blocks)
             : canneal::run_annealer(L1Objective(A_work, X, params.band_sort, params.centroid_sort),
-                                    params.engine);
+                                    params.engine,
+                                    rows.empty() ? nullptr : &rows);
         std::cout << "Final best score: " << global_best.score() << "\n";
         const Matrix best_X = transpose(global_best.Xt);
         if (n <= 20) {
@@ -689,8 +749,81 @@ int main(int argc, char** argv) {
                   << d << "); the basis is linearly dependent and the Gram matrix is singular\n";
     }
 
-    Matrix A = gram_of(curL);
+    if (modulus > 0) {
+        reduce_entries_mod(curL.data, modulus);
+        std::cout << "[modulus] " << modulus_note(modulus) << "\n";
+        for (int i = 0; i < m; ++i) {
+            const int64_t* ri = curL.row(i);
+            bool zero = true;
+            for (int k = 0; k < d; ++k) if (ri[k] != 0) { zero = false; break; }
+            if (zero) {
+                std::cerr << "Warning: row " << i << " became zero under the "
+                          << "modulus; the Gram matrix is singular\n";
+            }
+        }
+    }
+
+    // --lattice-dims changes only the metric: the Gram is built from a copy of
+    // the lattice with just the selected columns, while every unimodular update
+    // still acts on the full-dimensional lattice. The restricted copy exists
+    // only for this one gram_of call, so the hot path never sees it.
+    std::vector<int> dims;
+    if (!lattice_dims_spec.empty()) {
+        try {
+            dims = parse_index_spec(lattice_dims_spec, d, "--lattice-dims");
+            if (dims.empty())
+                throw std::runtime_error("--lattice-dims: no dimensions given");
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << "\n";
+            return 1;
+        }
+    }
+    auto gram_over_dims = [&](const Lattice& L) -> Matrix {
+        if (dims.empty()) return gram_of(L);
+        Lattice sub;
+        sub.m = L.m;
+        sub.d = (int)dims.size();
+        sub.data.assign((size_t)sub.m * sub.d, 0);
+        for (int i = 0; i < L.m; ++i) {
+            const int64_t* src = L.row(i);
+            int64_t* dst = sub.row(i);
+            for (int c = 0; c < sub.d; ++c) dst[c] = src[dims[(size_t)c]];
+        }
+        return gram_of(sub);
+    };
+
+    Matrix A = gram_over_dims(curL);
     std::cout << "[lattice] m=" << m << " d=" << d << " score=" << A.score() << "\n";
+    if (!dims.empty()) {
+        std::cout << "[lattice-dims] Gram built from " << dims.size()
+                  << " of " << d << " lattice dimensions\n";
+        if ((int)dims.size() < m)
+            std::cout << "[lattice-dims] note: fewer selected dimensions ("
+                      << dims.size() << ") than rows (" << m
+                      << "), so the restricted Gram is singular\n";
+        int zero_diag = 0;
+        for (int i = 0; i < m; ++i) if (A.at(i, i) == 0) ++zero_diag;
+        if (zero_diag > 0)
+            std::cout << "[lattice-dims] warning: " << zero_diag
+                      << " row(s) are zero on the selected dimensions; the "
+                         "restricted Gram is singular\n";
+    }
+
+    std::vector<int> rows;
+    if (!gram_rows_spec.empty()) {
+        try {
+            rows = parse_index_spec(gram_rows_spec, m, "--gram-rows");
+            if (rows.size() < 2)
+                throw std::runtime_error(
+                    "--gram-rows: need at least 2 rows (a move uses a pivot "
+                    "and a target)");
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << "\n";
+            return 1;
+        }
+        std::cout << "[gram-rows] restricting moves to " << rows.size()
+                  << " of " << m << " rows\n";
+    }
 
     Matrix I((size_t)m);
     I.fill_identity();
@@ -709,13 +842,16 @@ int main(int argc, char** argv) {
     L1Objective gb = any_deflate
         ? solve_with_deflation(A, params, params.deflate_blocks)
         : canneal::run_annealer(L1Objective(A, I, params.band_sort, params.centroid_sort),
-                                params.engine);
+                                params.engine,
+                                rows.empty() ? nullptr : &rows);
     const Matrix X = transpose(gb.Xt);
     std::cout << "Final best score: " << gb.score() << "\n";
 
-    // Final basis of the same lattice: L_final = X^T * L, Gram = gb.A.
+    // Final basis of the same lattice: L_final = X^T * L. The annealed Gram
+    // must match the Gram of L_final computed in the same (possibly
+    // --lattice-dims restricted) metric.
     Lattice Lfinal = xt_times(X, curL);
-    const Matrix g2 = gram_of(Lfinal);
+    const Matrix g2 = gram_over_dims(Lfinal);
     if (g2.n != gb.A.n || g2.data != gb.A.data) {
         std::cout << "[warn] Gram(X^T L) != annealed Gram (transform mismatch, possible int64 overflow)\n";
     }

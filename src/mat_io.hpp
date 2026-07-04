@@ -63,6 +63,91 @@ inline int64_t ext_gcd(int64_t a, int64_t b, int64_t& x, int64_t& y) {
     return old_r;
 }
 
+// Reduce every entry of a flat integer buffer modulo m, in place. This is a
+// one-shot preprocessing pass applied to freshly loaded input (--modulus);
+// nothing downstream carries a modulus, so the hot paths are unaffected.
+//
+// For m > 1 each entry is mapped to its balanced (least absolute) residue in
+// (-m/2, m/2], which keeps magnitudes as small as possible. m == 1 is a
+// special saturation mode: every nonzero entry becomes 1 and zero stays 0
+// (a plain mod 1 would zero the whole input). The caller validates that m
+// fits in int64.
+inline void reduce_entries_mod(std::vector<int64_t>& data, uint64_t m) {
+    if (m == 1) {
+        for (int64_t& v : data) v = (v != 0) ? 1 : 0;
+        return;
+    }
+    const int64_t mm = (int64_t)m;
+    const int64_t half = mm / 2;
+    for (int64_t& v : data) {
+        int64_t r = v % mm;        // truncated: sign follows v, |r| < m
+        if (r < 0) r += mm;        // now in [0, m)
+        if (r > half) r -= mm;     // balanced: (-m/2, m/2]
+        v = r;
+    }
+}
+
+// Parse an index-list option value against the valid range [0, n): comma-
+// separated 0-based indices and inclusive ranges written lo..hi (so
+// "0,3..6,9" selects 0, 3, 4, 5, 6, 9). Empty tokens and surrounding
+// whitespace are tolerated. opt is the option name used in error messages
+// (e.g. "--gram-rows"). Returns the sorted, deduplicated index list. Throws
+// std::runtime_error on a malformed token, a reversed range, or an index
+// outside [0, n).
+inline std::vector<int> parse_index_spec(const std::string& spec, int n,
+                                         const std::string& opt) {
+    auto parse_index = [n, &opt](const std::string& tok) -> int {
+        size_t pos = 0;
+        long long v = -1;
+        try {
+            v = std::stoll(tok, &pos);
+        } catch (const std::exception&) {
+            pos = 0;
+        }
+        if (pos != tok.size() || tok.empty() || v < 0)
+            throw std::runtime_error(opt + ": invalid index '" + tok + "'");
+        if (v >= (long long)n)
+            throw std::runtime_error(opt + ": index " + tok +
+                                     " out of range (valid indices are 0.." +
+                                     std::to_string(n - 1) + ")");
+        return (int)v;
+    };
+    auto trim = [](std::string s) {
+        const auto b = s.find_first_not_of(" \t");
+        if (b == std::string::npos) return std::string();
+        const auto e = s.find_last_not_of(" \t");
+        return s.substr(b, e - b + 1);
+    };
+    std::vector<int> idxs;
+    std::stringstream ss(spec);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        tok = trim(tok);
+        if (tok.empty()) continue;   // tolerate stray commas
+        const size_t dots = tok.find("..");
+        if (dots == std::string::npos) {
+            idxs.push_back(parse_index(tok));
+        } else {
+            const int lo = parse_index(trim(tok.substr(0, dots)));
+            const int hi = parse_index(trim(tok.substr(dots + 2)));
+            if (lo > hi)
+                throw std::runtime_error(opt + ": reversed range '" + tok + "'");
+            for (int r = lo; r <= hi; ++r) idxs.push_back(r);
+        }
+    }
+    std::sort(idxs.begin(), idxs.end());
+    idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+    return idxs;
+}
+
+// One-line human description of what reduce_entries_mod(m) did, for the tools'
+// startup logs.
+inline std::string modulus_note(uint64_t m) {
+    if (m == 1) return "saturated entries (nonzero -> 1, 0 stays 0)";
+    return "reduced entries mod " + std::to_string(m) +
+           " (balanced residues in (-m/2, m/2])";
+}
+
 // dst += c * src with overflow detection. Returns true on overflow.
 inline bool axpy_overflow(int64_t& dst, int64_t c, int64_t src) {
 #if defined(__GNUC__) || defined(__clang__)
