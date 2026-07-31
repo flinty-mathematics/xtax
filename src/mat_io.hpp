@@ -148,6 +148,24 @@ inline std::string modulus_note(uint64_t m) {
            " (balanced residues in (-m/2, m/2])";
 }
 
+// Clamp every entry of a flat integer buffer into [-n, n], in place. Like
+// reduce_entries_mod this is a one-shot preprocessing pass on freshly loaded
+// input (--saturate); nothing downstream carries the bound. The caller
+// validates that n > 0. A nonzero entry stays nonzero (its magnitude is at
+// least 1 <= n), so saturation never turns a nonzero row into a zero row.
+inline void saturate_entries(std::vector<int64_t>& data, int64_t n) {
+    for (int64_t& v : data) {
+        if (v > n) v = n;
+        else if (v < -n) v = -n;
+    }
+}
+
+// One-line human description of what saturate_entries(n) did, for startup logs.
+inline std::string saturate_note(int64_t n) {
+    return "saturated entries to [" + std::to_string(-n) + ", " +
+           std::to_string(n) + "]";
+}
+
 // dst += c * src with overflow detection. Returns true on overflow.
 inline bool axpy_overflow(int64_t& dst, int64_t c, int64_t src) {
 #if defined(__GNUC__) || defined(__clang__)

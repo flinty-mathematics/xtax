@@ -6,6 +6,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <commctrl.h>
+#include <uxtheme.h>
 
 #include "xbkz_ui.hpp"
 
@@ -16,6 +17,7 @@
 #include <vector>
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uxtheme.lib")
 // Themed common controls (v6) so marquee progress bars render correctly.
 #pragma comment(linker, \
     "\"/manifestdependency:type='win32' " \
@@ -59,6 +61,10 @@ struct UiState {
     std::function<bool()> finished;
     std::vector<bool> worker_marquee;
     std::vector<int> worker_pb_state;
+    // Whether each bar is currently drawn blue (themes disabled + custom bar
+    // colour) for the flattering phase. Tracked so the theme is only toggled on
+    // an actual phase change, not every refresh.
+    std::vector<bool> worker_flat_blue;
 };
 
 static bool phase_is_indeterminate(WorkerPhase p) {
@@ -153,6 +159,17 @@ static int worker_progress(const WorkerStatus& w) {
         if (pos > k_pb_max) pos = k_pb_max;
         return pos;
     }
+    // Flatter passes report rows swept out of the pass budget, so the (blue)
+    // bar rises across the segment sweeps and the final global LLL.
+    case WorkerPhase::flattering: {
+        const long long s = w.flat_step.load(std::memory_order_relaxed);
+        const long long t = w.flat_total.load(std::memory_order_relaxed);
+        if (t <= 0) return 0;
+        int pos = (int)std::lround(1000.0 * (double)s / (double)t);
+        if (pos < 0) pos = 0;
+        if (pos > k_pb_max) pos = k_pb_max;
+        return pos;
+    }
     case WorkerPhase::stopped:
         return k_pb_max;
     default:
@@ -160,13 +177,17 @@ static int worker_progress(const WorkerStatus& w) {
     }
 }
 
-static std::wstring worker_phase_text(const WorkerStatus& w) {
+static std::wstring worker_phase_text(const WorkerStatus& w, bool flatter_mode) {
     const auto phase = (WorkerPhase)w.phase.load(std::memory_order_relaxed);
     const int tour = w.tour.load(std::memory_order_relaxed);
     const int cur = w.cur_beta.load(std::memory_order_relaxed);
     const int tgt = w.target_beta.load(std::memory_order_relaxed);
     const int bi = w.block_idx.load(std::memory_order_relaxed);
     const int bt = w.block_total.load(std::memory_order_relaxed);
+
+    // In flatter mode the per-block re-reduction inside a tour is done by the
+    // flatter reducer, so mark the tour/sieve lines to show it is active.
+    const wchar_t* flat_tag = flatter_mode ? L" [flatter]" : L"";
 
     wchar_t buf[256];
     switch (phase) {
@@ -178,12 +199,21 @@ static std::wstring worker_phase_text(const WorkerStatus& w) {
         std::swprintf(buf, 256, L"Warmup  \u03B2=%d/%d  tour %d", cur, tgt, tour);
         return buf;
     case WorkerPhase::tour:
-        std::swprintf(buf, 256, L"Tour  \u03B2=%d  block %d/%d  %s nodes", cur, bi, bt,
+        std::swprintf(buf, 256, L"Tour%s  \u03B2=%d  block %d/%d  %s nodes",
+                      flat_tag, cur, bi, bt,
                       fmt_count(w.enum_nodes.load(std::memory_order_relaxed)).c_str());
         return buf;
     case WorkerPhase::sieving:
-        std::swprintf(buf, 256, L"Sieving  \u03B2=%d  block %d/%d", cur, bi, bt);
+        std::swprintf(buf, 256, L"Sieving%s  \u03B2=%d  block %d/%d", flat_tag,
+                      cur, bi, bt);
         return buf;
+    case WorkerPhase::flattering: {
+        const long long s = w.flat_step.load(std::memory_order_relaxed);
+        const long long t = w.flat_total.load(std::memory_order_relaxed);
+        const int pct = t > 0 ? (int)std::lround(100.0 * (double)s / (double)t) : 0;
+        std::swprintf(buf, 256, L"Flattering  %d%%", pct);
+        return buf;
+    }
     case WorkerPhase::reseed:
         return L"Reseeding from global best";
     case WorkerPhase::stopped:
@@ -192,11 +222,12 @@ static std::wstring worker_phase_text(const WorkerStatus& w) {
     return L"?";
 }
 
-static std::wstring worker_phase_label(const WorkerStatus& w, bool shutting_down) {
+static std::wstring worker_phase_label(const WorkerStatus& w, bool shutting_down,
+                                       bool flatter_mode) {
     const auto phase = (WorkerPhase)w.phase.load(std::memory_order_relaxed);
     if (shutting_down && phase != WorkerPhase::stopped)
         return L"Stopping";
-    return worker_phase_text(w);
+    return worker_phase_text(w, flatter_mode);
 }
 
 static void layout_client(UiState* ui) {
@@ -272,6 +303,30 @@ static void refresh_ui(UiState* ui) {
         const auto phase = (WorkerPhase)w.phase.load(std::memory_order_relaxed);
         const bool indet = phase_is_indeterminate(phase);
 
+        // Blue bar for flatter work: the flattering phase always, and in
+        // --flatter mode also the tour/sieve phases, whose per-block re-reduction
+        // is done by the flatter reducer (the bar still tracks block progress;
+        // the blue just signals the mode). Themed progress bars ignore
+        // PBM_SETBARCOLOR, so the theme is stripped from this bar while it is
+        // blue and restored (forcing the state colour to reapply) afterwards.
+        // Done before the marquee/state handling so those act on the correct
+        // (themed or unthemed) control.
+        const bool tour_like =
+            (phase == WorkerPhase::tour || phase == WorkerPhase::sieving);
+        const bool want_blue = (phase == WorkerPhase::flattering)
+                               || (ui->cfg->flatter && tour_like);
+        if (want_blue != ui->worker_flat_blue[i]) {
+            if (want_blue) {
+                SetWindowTheme(ui->worker_pb[i], L"", L"");
+                SendMessageW(ui->worker_pb[i], PBM_SETBARCOLOR, 0,
+                             (LPARAM)RGB(38, 120, 224));
+            } else {
+                SetWindowTheme(ui->worker_pb[i], nullptr, nullptr);
+                ui->worker_pb_state[i] = -1;  // force state colour to reapply
+            }
+            ui->worker_flat_blue[i] = want_blue;
+        }
+
         if (indet != ui->worker_marquee[i]) {
             set_progress_marquee(ui->worker_pb[i], indet);
             ui->worker_marquee[i] = indet;
@@ -288,7 +343,8 @@ static void refresh_ui(UiState* ui) {
         const bool shutting_down =
             ui->stop_flag && ui->stop_flag->load(std::memory_order_relaxed);
         SetWindowTextW(ui->worker_phase[i],
-                       worker_phase_label(w, shutting_down).c_str());
+                       worker_phase_label(w, shutting_down,
+                                          ui->cfg->flatter).c_str());
     }
 }
 
@@ -328,6 +384,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ui->worker_phase.resize((size_t)n);
         ui->worker_marquee.assign((size_t)n, false);
         ui->worker_pb_state.assign((size_t)n, -1);
+        ui->worker_flat_blue.assign((size_t)n, false);
         for (int i = 0; i < n; ++i) {
             const int base = IDC_WORKER_BASE + i * 3;
             wchar_t idbuf[16];

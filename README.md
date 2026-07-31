@@ -1,9 +1,8 @@
 # XTAX
 
 Heavily improved and slop coded with AI assistance.
-Three related C++20 command-line tools for integer lattice and matrix
-reduction, sharing a common CSV-based I/O layer and (for the two annealers) a
-common multithreaded simulated-annealing engine:
+C++20 command-line tools for integer lattice, matrix reduction, and
+combinatorial matrix search:
 
 - **xtax**: a random-congruence annealer that drives a symmetric integer
   matrix $A$ toward a diagonal form via unimodular congruences $X^\top A X$,
@@ -14,6 +13,10 @@ common multithreaded simulated-annealing engine:
 - **xbkz**: a standalone multithreaded BKZ lattice reducer built from scratch
   (Gram-Schmidt, LLL, pruned Schnorr-Euchner enumeration, and an optional block
   sieve), independent of the two annealers above.
+- **xweigh**: a standalone fixed-degree ternary annealer that searches for a
+  weighing matrix $W(n,w)$ satisfying $W W^\top = wI$.
+- **xweigh_cuda**: a GPU population annealer for the same weighing-matrix
+  problem on orders that fit in device shared memory.
 
 Background on the congruence-annealing idea:
 https://mathematica.stackexchange.com/a/314866/72682
@@ -30,10 +33,9 @@ cmake --build build_dir --config Release
 
 This same pair of commands works on both single-config generators (Makefiles,
 Ninja) and multi-config generators (Visual Studio): each generator simply
-ignores the configuration flag it does not use. The three executables land in
-`build_dir/xtax`, `build_dir/xbkz`, `build_dir/xdual` on Linux and macOS, or
-`build_dir/Release/*.exe` on Windows. Release builds enable AVX2 where
-supported.
+ignores the configuration flag it does not use. The executables land under
+`build_dir/` on Linux and macOS, or `build_dir/Release/*.exe` on Windows.
+Release builds enable AVX2 where supported.
 
 Two opt-in CMake options tune the floating-point-heavy paths (`xbkz`'s
 reducer and `xdual`'s dual maintenance):
@@ -462,9 +464,10 @@ block size, and enumeration/sieve progress; `--no-gui` disables it. Elsewhere
 
 ## Input modulus
 
-All three tools accept `--modulus <uint>` (> 0). It reduces the entries of the
-loaded input (the `-A` matrix or the `-L` basis) exactly once, at load time, so
-it costs a single pass over the input and adds nothing to the hot paths.
+`xtax`, `xdual`, and `xbkz` accept `--modulus <uint>` (> 0). It reduces the
+entries of the loaded input (the `-A` matrix or the `-L` basis) exactly once,
+at load time, so it costs a single pass over the input and adds nothing to the
+hot paths.
 
 - **`--modulus m` with `m > 1`**: every entry is replaced by its balanced
   (least absolute) residue in $(-m/2,\, m/2]$, which keeps magnitudes as small
@@ -483,20 +486,164 @@ singular).
 
 ## Shared machinery
 
-All three tools share a small set of header-only C++20 pieces under `src/`:
+The congruence annealers and `xbkz` share common C++20 infrastructure: dense
+matrix and lattice I/O, graceful Ctrl-C shutdown with a final best-result write,
+and (for `xtax` and `xdual`) a templated simulated-annealing engine with
+pluggable objectives. `xbkz` has its own independent reduction core and does
+not use that engine.
 
-- `mat_io.hpp`: the dense integer `Matrix` (and floating-point `Matrixd`) types,
-  the `Lattice` basis type, atomic CSV read/write, and small integer helpers
-  (nearest-integer division, extended gcd, overflow-checked axpy, a
-  mod-prime unimodularity test).
-- `stop_signal.hpp`: the Ctrl-C / stop-flag plumbing shared by all worker
-  pools, so every tool shuts down gracefully and writes its best result so far.
-- `congruence_anneal.hpp`: the templated simulated-annealing engine shared by
-  `xtax` and `xdual` (worker threads and affinity, the temperature schedule,
-  the move loop, the plateau-breaking reduction sweep, and the throttled
-  global-best publish). Each tool supplies its own objective policy (`L1Objective`
-  for `xtax`, `DualObjective` for `xdual`); `xbkz` has its own independent
-  reduction core and does not use this engine.
+## xweigh: unrestricted weighing-matrix annealer
 
-`bench/benchmark.py` (xtax) and `bench/xdual_benchmark.py` (xdual) measure how
-quickly the score drops for one or more configurations on a given matrix.
+`xweigh` searches for an $n \times n$ matrix with entries in
+$\{-1,0,1\}$ such that
+
+$$W W^\top = w I.$$
+
+Every candidate always has exactly $w$ nonzeros in every row and every column.
+The annealer minimizes the exact integer residual
+
+$$\sum_{i \lt j} |\langle W_i,W_j\rangle|,$$
+
+which is zero exactly when all distinct rows are orthogonal. Because the
+candidate is square and has nonzero weight, a solution also satisfies
+$W^\top W = wI$.
+
+This is a direct combinatorial search, not a unimodular congruence search.
+Starting from $I$, a congruence $X^\top X=wI$ with unimodular $X$ would force
+$w=1$ by determinants, so xtax's shear moves cannot generate nontrivial
+weighing matrices.
+
+### Search
+
+The initial support is a randomized $w$-regular bipartite graph. Two move
+types keep the row and column weights exact:
+
+- flip the sign of one nonzero entry;
+- switch the support of a legal $2 \times 2$ submatrix, moving two nonzeros
+  across its diagonal.
+
+A dense cached Gram matrix makes evaluating either move $O(n)$. The hot path
+stores `W` column-major as signed bytes so the changed columns are streamed
+contiguously, stores the Gram as signed 16-bit integers, and keeps only the
+smaller of each row's support or zero set. Multiple workers use parallel
+tempering by default. Each worker owns its cache-aligned state, so memory use
+is proportional to `threads * n^2`; startup reports the estimated memory per
+worker and in total.
+
+When $w$ is a power of two and divides $n$, xweigh constructs a direct sum of
+Sylvester Hadamard blocks as the start state and skips annealing when that
+start is already a weighing matrix. This is a valid (possibly decomposable)
+$W(n,w)$. Other parameters use the annealer.
+
+### Usage
+
+```
+xweigh <n> <w> [options]
+```
+
+The best candidate is written atomically to `best_W.csv` by default. A run
+that reaches score zero performs an independent exact verification before
+reporting success. On a time limit or Ctrl-C, the best fixed-weight candidate
+is still written, but it need not yet be a weighing matrix.
+
+| Option | Default | Description |
+|---|---|---|
+| `n` | required | Matrix order, in `1..32767`. |
+| `w` | required | Weight, in `1..n`. |
+| `-o, --out <file>` | `best_W.csv` | Output CSV for the best matrix. |
+| `--start <file>` | none | Start from a complete ternary CSV with weight `w` in every row and column. |
+| `-t, --threads <int>` | physical cores | Number of worker states. |
+| `--use-hyperthreads` | off | Default to all logical processors. |
+| `--no-pin` | off | Disable Windows physical-core affinity. |
+| `--seed <uint>` | `0` | Base seed (`0` uses `random_device`). |
+| `--max-seconds <float>` | `0` | Search budget (`0` runs until solved or interrupted). |
+| `--save-interval <float>` | `2` | Minimum seconds between atomic best writes. |
+| `--sign-fraction <float>` | `0.5` | Probability of proposing a sign flip. |
+| `--greedy-fraction <float>` | `0.5` | Probability of best-of-samples move selection. |
+| `--candidate-samples <int>` | `4` | Candidates scored by a sampled greedy move. |
+| `--target-fraction <float>` | `0.7` | Probability of targeting a high-residual row. |
+| `--target-samples <int>` | `8` | Hot-row tournament size. |
+| `--tempering / --no-tempering` | on | Parallel tempering for two or more workers. |
+| `--exchange-interval <int>` | `2000` | Approximate moves per worker between exchanges. |
+| `--t-init <float>` | `0` | Initial temperature (`0` auto-calibrates). |
+| `--t-min <float>` | `0.25` | Minimum temperature. |
+| `--cooling <float>` | `0.999` | Single-worker geometric cooling factor. |
+| `--moves-per-cool <int>` | `500` | Single-worker moves between cooling steps. |
+| `--stuck-threshold <int>` | `50000` | Moves without improvement before reheating. |
+| `--reheat <float>` | `1` | Fraction of initial temperature restored. |
+| `--reseed-factor <float>` | `1.25` | Reseed a lagging worker from the global best. |
+
+Examples:
+
+```
+xweigh 7 4
+xweigh 512 25 -t 16 --max-seconds 60
+xweigh 1000 64 --seed 1234 -o W-1000-64.csv
+xweigh 35 25 --start previous-best.csv --max-seconds 300
+```
+
+xweigh rejects only elementary proven impossibilities before searching:
+
+- $w = n$ when $n \gt 2$ and $n$ is not a valid Hadamard order (1, 2, or a
+  multiple of 4);
+- odd $n$ when $w$ is not a perfect square;
+- odd $n$ when $n \lt w + \sqrt{w} + 1$;
+- $n \equiv 2 \pmod 4$ when $w$ is not a sum of two integer squares.
+
+Failure to reach score zero is not evidence of nonexistence. Unrestricted
+search remains exponential in difficult cases, and large dense instances can
+require substantial memory and time.
+
+### CUDA population annealer
+
+When a CUDA compiler is available, CMake also builds `xweigh_cuda`. This is a
+separate small-order solver which runs many independent annealing replicas on
+the GPU. Each CUDA block owns one replica, keeps its matrix and exact Gram
+cache in shared memory, and uses separate warps to score sampled candidate
+moves concurrently. The CPU `xweigh` target and its search are unchanged.
+
+```
+cmake -B build_dir -DCMAKE_BUILD_TYPE=Release -DXTAX_BUILD_CUDA=ON
+cmake --build build_dir --config Release
+build_dir/Release/xweigh_cuda 35 25 --max-seconds 60
+```
+
+`--replicas 0` selects a population from the device occupancy; an explicit
+positive value overrides it. `--moves-per-launch` controls how often the GPU
+returns to the host for stopping, progress, and checkpointing. The annealing
+options shared with `xweigh` have the same meaning, but this first CUDA path
+uses a cooling/reheating population rather than CPU parallel tempering.
+`--start <file>` initializes every replica from the same validated candidate;
+their independent random streams and temperature ladder then make them
+diverge. In both executables the CSV must contain all $n^2$ ternary entries
+and already have exactly $w$ nonzeros in every row and column. Unknown or
+blank cells are not accepted.
+
+For difficult resumed candidates, the CUDA population also uses three larger
+search mechanisms:
+
+- atomic double-sign moves and support switches which can choose new signs;
+- replicas guided by squared Gram residual or by the number of odd support
+  intersections, alongside the usual $L_1$ replicas;
+- elite restarts after a global-best plateau. These preserve the best replica
+  and distribute the others across low-cost uphill support/sign exits,
+  row-sign perturbations, support perturbations, and mixed random kicks.
+
+The relevant controls are `--double-sign-fraction`,
+`--switch-sign-fraction`, `--squared-objective-fraction`,
+`--parity-objective-fraction`, `--restart-interval`,
+`--restart-fraction`, and `--restart-kick-min/max`. Setting
+`--restart-interval 0`, both compound fractions to zero, and both alternate
+objective fractions to zero recovers the previous independent-replica move
+set.
+
+```
+build_dir/Release/xweigh_cuda 35 25 \
+  --start previous-best.csv --max-seconds 300
+```
+
+The complete state of a replica must fit in one block's shared memory.
+`xweigh_cuda` checks that limit for the selected device and rejects larger
+orders with the required and available byte counts. Use CPU `xweigh` for those
+instances. CUDA support is optional so systems without the CUDA toolkit,
+including macOS, continue to configure and build the CPU tools normally.

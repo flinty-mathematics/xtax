@@ -83,9 +83,14 @@ static_assert(std::is_same<real_t, double>::value,
 
 using Clock = std::chrono::steady_clock;
 
+struct FlatterParams;  // defined after Reducer; only a pointer is needed here
+
 // Optional context passed into a BKZ tour for live status reporting.
 struct BkzTourContext {
     WorkerStatus* status = nullptr;
+    // When non-null and enabled, the per-insertion block re-reduction inside the
+    // tour uses the flatter-style windowed reducer instead of plain LLL.
+    const FlatterParams* fp = nullptr;
 };
 
 // Thrown when an int64 basis entry would overflow during reduction. The worker
@@ -375,6 +380,38 @@ struct Reducer {
         }
     }
 
+    // LLL with the Lovasz swaps confined to the window [lo, hi): only adjacent
+    // pairs inside the window are ever swapped, but size-reduction is still done
+    // against all earlier rows (j from k-1 down to 0). Restricting size
+    // reduction to the window would leave each row's components along rows below
+    // lo unreduced, which overflows the int64 basis; full size reduction keeps
+    // the integer entries bounded exactly as plain LLL does and does not change
+    // the projected reduction (size reduction never alters the Gram-Schmidt
+    // norms r, only the representation). This is the per-tile reduction of the
+    // flatter-style segmented sweep. seg_delta lets a caller run the window at a
+    // different Lovasz parameter than the global delta without disturbing the
+    // enumeration path. Throws ReduceAbort if the step cap is exceeded and
+    // ReduceOverflow on int64 basis overflow.
+    void lll_segment(int lo, int hi, double seg_delta, long long max_steps) {
+        if (hi - lo < 2) return;
+        int k = lo + 1;
+        long long steps = 0;
+        while (k < hi) {
+            if (g_stop.load(std::memory_order_relaxed)) return;
+            if (max_steps > 0 && ++steps > max_steps) throw ReduceAbort{};
+            for (int j = k - 1; j >= 0; --j) size_reduce(k, j);
+            real_t lhs = r[k];
+            real_t m = M(k, k - 1);
+            real_t rhs = ((real_t)seg_delta - m * m) * r[k - 1];
+            if (lhs >= rhs) {
+                ++k;
+            } else {
+                swap_with_prev(k);
+                k = std::max(k - 1, lo + 1);
+            }
+        }
+    }
+
     real_t potential() const {
         real_t p = 0;
         for (int i = 0; i < n; ++i) {
@@ -431,6 +468,179 @@ struct Reducer {
         return best;
     }
 };
+
+// Parameters for one flatter-style reduction pass. See flatter_reduce. Kept a
+// plain aggregate so each worker can cheaply build its own diversified copy.
+struct FlatterParams {
+    bool enabled = false;
+    int seg = 32;          // base segment (tile) size
+    int offset = 0;        // tiling offset for the aligned (even) sweeps
+    double delta = 0.99;   // Lovasz parameter used by the segment sweeps
+    int max_iters = 6;     // maximum number of alternating segment sweeps
+};
+
+// A flatter-inspired reducer built on xbkz's existing double-precision GSO.
+// Instead of one global LLL sweep it repeatedly reduces overlapping segments
+// (tiles) of the basis, alternating the tile boundaries between sweeps so a
+// seam in one sweep becomes a tile interior in the next. Each segment sweep is
+// a cheap local (projected) LLL, so the profile flattens quickly; a final
+// global LLL then guarantees the output is genuinely LLL-reduced regardless of
+// the segment schedule. This mirrors flatter's iterated compression without its
+// arbitrary-precision machinery (the int64 entries here need no compression),
+// and different segment schedules across workers give distinct reduction paths.
+//
+// Throws ReduceOverflow on int64 basis overflow (the caller rolls back). A
+// segment that exhausts its step cap is caught internally and left to the
+// global sweep to finish, so ReduceAbort does not escape.
+static void flatter_reduce(Reducer& red, const FlatterParams& fp,
+                           long long cap, WorkerStatus* status) {
+    const int n = red.n;
+    if (n < 2) return;
+
+    // Rebuild the Gram and GSO up front: the basis may have been perturbed by
+    // the caller, and this also bounds floating-point drift.
+    red.build_gram();
+    red.compute_gso();
+
+    const int seg = std::clamp(fp.seg, 4, std::max(4, n));
+    const long long seg_cap = cap > 0
+        ? cap
+        : 20000LL + 2000LL * (long long)seg + 20LL * (long long)n;
+    const int max_iters = std::max(1, fp.max_iters);
+
+    // Progress is reported as rows swept across all planned sweeps plus one
+    // pass for the final global LLL, so the bar rises monotonically.
+    const long long total = (long long)(max_iters + 1) * (long long)n;
+    if (status) {
+        status->flat_total.store(total, std::memory_order_relaxed);
+        status->flat_step.store(0, std::memory_order_relaxed);
+    }
+    long long done = 0;
+
+    real_t prev_pot = red.potential();
+    std::vector<int> cuts;
+    for (int it = 0; it < max_iters; ++it) {
+        if (g_stop.load(std::memory_order_relaxed)) return;
+        // Alternate the tiling: even sweeps align at fp.offset, odd sweeps shift
+        // by half a segment so tile seams move.
+        const int off = (it % 2 == 0) ? (fp.offset % seg)
+                                       : ((fp.offset + seg / 2) % seg);
+        cuts.clear();
+        cuts.push_back(0);
+        for (int c = off; c < n; c += seg) if (c > 0) cuts.push_back(c);
+        cuts.push_back(n);
+
+        try {
+            for (size_t t = 0; t + 1 < cuts.size(); ++t) {
+                if (g_stop.load(std::memory_order_relaxed)) return;
+                red.lll_segment(cuts[t], cuts[t + 1], fp.delta, seg_cap);
+                done += (long long)(cuts[t + 1] - cuts[t]);
+                if (status)
+                    status->flat_step.store(done, std::memory_order_relaxed);
+            }
+        } catch (const ReduceAbort&) {
+            // A segment blew its step cap; let the global LLL below finish.
+        }
+
+        const real_t pot = red.potential();
+        // Converged when a whole sweep no longer meaningfully lowers the
+        // potential. Compared in absolute terms scaled by magnitude because the
+        // potential is a sum of logs and may be negative.
+        if (std::fabs(pot - prev_pot) <= 1e-9 * (std::fabs(prev_pot) + 1.0)) {
+            done = (long long)max_iters * (long long)n;
+            if (status)
+                status->flat_step.store(done, std::memory_order_relaxed);
+            break;
+        }
+        prev_pot = pot;
+    }
+
+    // Final global sweep: size reduces against all earlier rows and enforces the
+    // Lovasz condition globally, so the result is a valid LLL-reduced basis.
+    if (!g_stop.load(std::memory_order_relaxed)) {
+        try {
+            red.lll(1, cap);
+        } catch (const ReduceAbort&) {
+            // Bounded final sweep exhausted; the partially reduced basis is
+            // still a valid basis of the same lattice.
+        }
+    }
+    if (status)
+        status->flat_step.store(status->flat_total.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+}
+
+// Whole-basis re-reduction used on the worker path: plain global LLL, or the
+// flatter-style reducer when enabled. When flattering, the worker's phase is
+// switched to WorkerPhase::flattering (which the UI draws with a blue bar) for
+// the duration and restored afterwards. ReduceOverflow propagates so the caller
+// can roll back.
+static void reduce_whole(Reducer& red, const FlatterParams& fp, long long cap,
+                         WorkerStatus* status) {
+    if (!fp.enabled) {
+        red.lll(1, cap);
+        return;
+    }
+    const int prev = status ? status->phase.load(std::memory_order_relaxed)
+                            : (int)WorkerPhase::tour;
+    if (status)
+        status->phase.store((int)WorkerPhase::flattering,
+                            std::memory_order_relaxed);
+    flatter_reduce(red, fp, cap, status);
+    if (status)
+        status->phase.store(prev, std::memory_order_relaxed);
+}
+
+// Windowed flatter reduction over [lo, n), used as the per-insertion reducer
+// inside a BKZ tour (the --flatter replacement for the plain red.lll(lo, cap)
+// after a block insertion). Unlike flatter_reduce it does NOT rebuild the Gram
+// or GSO: the caller has just refreshed the GSO for the affected rows via
+// update_gso_after_block and the incremental GSO for the earlier rows is still
+// valid. It runs a few alternating segment sweeps over the affected suffix,
+// then a windowed global LLL from lo, matching the reduction scope of the LLL
+// call it replaces. A segment that hits its step cap is caught and left to the
+// final LLL; the final LLL's ReduceAbort and any ReduceOverflow propagate so
+// the caller rolls back exactly as it did with plain LLL.
+static void flatter_reduce_window(Reducer& red, const FlatterParams& fp,
+                                  int lo, long long cap) {
+    const int n = red.n;
+    lo = std::max(1, lo);
+    if (n - lo < 2) {
+        red.lll(lo, cap);
+        return;
+    }
+
+    const int seg = std::clamp(fp.seg, 4, std::max(4, n - lo));
+    const long long seg_cap = cap > 0
+        ? cap
+        : 20000LL + 2000LL * (long long)seg + 20LL * (long long)n;
+    const int max_iters = std::max(1, fp.max_iters);
+
+    real_t prev_pot = red.potential();
+    std::vector<int> cuts;
+    for (int it = 0; it < max_iters; ++it) {
+        if (g_stop.load(std::memory_order_relaxed)) return;
+        const int off = (it % 2 == 0) ? (fp.offset % seg)
+                                       : ((fp.offset + seg / 2) % seg);
+        cuts.clear();
+        cuts.push_back(lo);
+        for (int c = lo + off; c < n; c += seg) if (c > lo) cuts.push_back(c);
+        cuts.push_back(n);
+        try {
+            for (size_t t = 0; t + 1 < cuts.size(); ++t) {
+                if (g_stop.load(std::memory_order_relaxed)) return;
+                red.lll_segment(cuts[t], cuts[t + 1], fp.delta, seg_cap);
+            }
+        } catch (const ReduceAbort&) {
+            // A segment exhausted its cap; the final windowed LLL finishes.
+        }
+        const real_t pot = red.potential();
+        if (std::fabs(pot - prev_pot) <= 1e-9 * (std::fabs(prev_pot) + 1.0))
+            break;
+        prev_pot = pot;
+    }
+    red.lll(lo, cap);
+}
 
 // Pruned Schnorr-Euchner enumeration over a block [k0, k0+h). Finds integer
 // coefficients x (over basis vectors b_{k0+i}) whose projected vector is
@@ -962,9 +1172,13 @@ static void apply_block_transform(Reducer& red, int k0,
     }
 }
 
-// Insert a shorter block vector via a unimodular block transform + LLL.
+// Insert a shorter block vector via a unimodular block transform, then re-reduce
+// the affected suffix. In --flatter mode the re-reduction uses the windowed
+// flatter reducer; otherwise plain LLL. Both reduce from kappa to the end, so
+// the scope and the overflow/abort rollback behaviour are identical.
 static bool try_insert_block_vector(Reducer& red, int kappa, int h,
-                                    std::vector<int64_t> coeff) {
+                                    std::vector<int64_t> coeff,
+                                    const FlatterParams* fp = nullptr) {
     if (g_stop.load(std::memory_order_relaxed)) return false;
     if (!coeff_make_primitive(coeff)) return false;
     const long long lll_step_cap =
@@ -974,7 +1188,10 @@ static bool try_insert_block_vector(Reducer& red, int kappa, int h,
     try {
         apply_block_transform(red, kappa, H);
         red.update_gso_after_block(kappa, h);
-        red.lll(std::max(1, kappa), lll_step_cap);
+        if (fp && fp->enabled)
+            flatter_reduce_window(red, *fp, std::max(1, kappa), lll_step_cap);
+        else
+            red.lll(std::max(1, kappa), lll_step_cap);
         return true;
     } catch (const ReduceOverflow&) {
         red.restore_state();
@@ -994,7 +1211,7 @@ static bool try_insert_block_vector(Reducer& red, int kappa, int h,
 // or leaves the block unchanged.
 static void preprocess_block(Reducer& red, int kappa, int h, int pre_beta,
                              real_t prune, long long node_limit,
-                             real_t gh_factor) {
+                             real_t gh_factor, const FlatterParams* fp) {
     if (pre_beta < 2 || h <= pre_beta) return;
     Enumerator en;
     std::vector<int> coeff;
@@ -1008,7 +1225,7 @@ static void preprocess_block(Reducer& red, int kappa, int h, int pre_beta,
             continue;
         coeff64.assign(coeff.begin(), coeff.end());
         if (!coeff_make_primitive(coeff64)) continue;
-        try_insert_block_vector(red, k, hb, std::move(coeff64));
+        try_insert_block_vector(red, k, hb, std::move(coeff64), fp);
     }
 }
 
@@ -1028,6 +1245,9 @@ static bool bkz_tour(Reducer& red, int beta, std::mt19937_64& rng, real_t prune,
                      const BkzTourContext* ctx = nullptr) {
     int n = red.n;
     bool changed = false;
+    // The flatter-mode inner reducer used for block re-reduction, if enabled.
+    const FlatterParams* fp = (ctx && ctx->fp && ctx->fp->enabled) ? ctx->fp
+                                                                    : nullptr;
     if (refresh_gso) {
         red.build_gram();
         red.compute_gso();
@@ -1100,7 +1320,7 @@ static bool bkz_tour(Reducer& red, int beta, std::mt19937_64& rng, real_t prune,
             if (hit) {
                 if (ctx && ctx->status)
                     ctx->status->blocks_hit.fetch_add(1, std::memory_order_relaxed);
-                if (try_insert_block_vector(red, kappa, h, std::move(sc)))
+                if (try_insert_block_vector(red, kappa, h, std::move(sc), fp))
                     changed = true;
             }
         } else {
@@ -1109,7 +1329,7 @@ static bool bkz_tour(Reducer& red, int beta, std::mt19937_64& rng, real_t prune,
             // the full-beta search on this block.
             if (preprocess_beta > 0 && h > preprocess_beta) {
                 preprocess_block(red, kappa, h, preprocess_beta, prune,
-                                 enum_node_limit, gh_factor);
+                                 enum_node_limit, gh_factor, fp);
                 if (g_stop.load(std::memory_order_relaxed)) break;
             }
             if (ctx && ctx->status) {
@@ -1131,7 +1351,7 @@ static bool bkz_tour(Reducer& red, int beta, std::mt19937_64& rng, real_t prune,
 
             if (ctx && ctx->status)
                 ctx->status->blocks_hit.fetch_add(1, std::memory_order_relaxed);
-            if (try_insert_block_vector(red, kappa, h, std::move(coeff64)))
+            if (try_insert_block_vector(red, kappa, h, std::move(coeff64), fp))
                 changed = true;
         }
         if (g_stop.load(std::memory_order_relaxed)) break;
@@ -1151,7 +1371,8 @@ static bool bkz_tour(Reducer& red, int beta, std::mt19937_64& rng, real_t prune,
 // rolls back. Pass lll_max_steps = 0 to shear only (no LLL). The default is a
 // bounded reduction suitable for an already-LLL-reduced basis.
 static void light_nudge(Reducer& red, std::mt19937_64& rng,
-                        long long lll_max_steps = -1) {
+                        long long lll_max_steps, const FlatterParams& fp,
+                        WorkerStatus* status) {
     int n = red.n;
     if (n < 2) return;
     red.save_state();
@@ -1176,7 +1397,7 @@ static void light_nudge(Reducer& red, std::mt19937_64& rng,
         if (lll_max_steps < 0)
             lll_max_steps = 200000LL + 1000LL * (long long)n;
         if (lll_max_steps > 0)
-            red.lll(1, lll_max_steps);
+            reduce_whole(red, fp, lll_max_steps, status);
     } catch (const ReduceOverflow&) {
         red.restore_state();
     } catch (const ReduceAbort&) {
@@ -1192,7 +1413,8 @@ static void light_nudge(Reducer& red, std::mt19937_64& rng,
 // basis (local intensification near a good point), 1.0 is a full diversifying
 // kick. Pass lll_max_steps = 0 to shear only (no LLL). Overflow rolls back.
 static void strong_randomize(Reducer& red, std::mt19937_64& rng,
-                             double strength = 1.0, long long lll_max_steps = -1) {
+                             double strength, long long lll_max_steps,
+                             const FlatterParams& fp, WorkerStatus* status) {
     int n = red.n;
     if (n < 4) return;
     strength = std::clamp(strength, 0.05, 1.0);
@@ -1223,7 +1445,7 @@ static void strong_randomize(Reducer& red, std::mt19937_64& rng,
         if (lll_max_steps < 0)
             lll_max_steps = 200000LL + 1000LL * (long long)n;
         if (lll_max_steps > 0)
-            red.lll(1, lll_max_steps);
+            reduce_whole(red, fp, lll_max_steps, status);
     } catch (const ReduceOverflow&) {
         red.restore_state();
     } catch (const ReduceAbort&) {
@@ -1245,6 +1467,30 @@ static real_t flat_shortest_norm2(const std::vector<int64_t>& B, int rows,
     }
     if (idx) *idx = bi;
     return best < 0 ? 0 : best;
+}
+
+// Apply the unimodular transform U (rows x rows, row-major) to the original
+// basis L0 (rows x cols), producing out = U * L0 (rows x cols). Returns false
+// on int64 overflow, leaving out unspecified. Used by --modulus / --saturate to
+// map a reduction that ran on a modified copy back onto the untouched original
+// basis: best.U satisfied reduced = U * L_work, and U * L0 is a basis of the
+// original lattice (U is unimodular).
+static bool apply_transform(const std::vector<int64_t>& U, const Lattice& L0,
+                            int rows, int cols, std::vector<int64_t>& out) {
+    out.assign((size_t)rows * cols, 0);
+    for (int i = 0; i < rows; ++i) {
+        const int64_t* ui = U.data() + (size_t)i * rows;
+        int64_t* oi = out.data() + (size_t)i * cols;
+        for (int j = 0; j < rows; ++j) {
+            const int64_t c = ui[j];
+            if (c == 0) continue;
+            const int64_t* lj = L0.row(j);
+            for (int k = 0; k < cols; ++k) {
+                if (axpy_overflow(oi[k], c, lj[k])) return false;
+            }
+        }
+    }
+    return true;
 }
 
 static bool better(real_t b0, real_t pot,
@@ -1367,7 +1613,25 @@ struct RunParams {
     bool progressive = true;   // per-worker progressive beta schedule (else random)
     int preprocess_beta = 0;   // local block preprocessing block size (0 = off)
     double gh_factor = 0.0;    // Gaussian-heuristic enum radius cap factor (0 = off)
+    bool flatter = false;      // use the flatter-style segmented reducer for the
+                               // whole-basis LLL calls (initial + perturbations)
+    int flatter_seg = 32;      // base segment (tile) size for flatter sweeps
+    int flatter_iters = 6;     // max alternating segment sweeps per flatter pass
 };
+
+// Build a worker's flatter parameters. Each worker gets a distinct segment
+// size, tiling offset, Lovasz delta and sweep budget so that no two workers
+// follow the same reduction path (LLL is not confluent, so different segment
+// schedules settle on different reduced bases). id == 0 keeps the base values.
+static FlatterParams make_flatter_params(const RunParams& p, int id) {
+    FlatterParams fp;
+    fp.enabled = p.flatter;
+    fp.seg = std::max(4, p.flatter_seg + 8 * (id % 4));
+    fp.offset = (id % 2) ? (fp.seg / 2) : 0;
+    fp.delta = std::clamp(p.delta - 0.01 * (double)(id % 3), 0.5, 0.999);
+    fp.max_iters = std::max(1, p.flatter_iters + (id % 2));
+    return fp;
+}
 
 // One shared initial LLL on the loaded basis before workers start. Seeds
 // global best with the result (or the raw basis when --no-init-lll is set).
@@ -1392,7 +1656,12 @@ static bool prepare_starting_basis(const Lattice& L0, const RunParams& p,
     if (!p.no_init_lll) {
         red.save_state();
         try {
-            red.lll(1);
+            if (p.flatter) {
+                FlatterParams fp = make_flatter_params(p, 0);
+                flatter_reduce(red, fp, 0, nullptr);
+            } else {
+                red.lll(1);
+            }
         } catch (const ReduceOverflow&) {
             red.restore_state();
             return false;
@@ -1456,6 +1725,12 @@ static void worker(int id, const Lattice& L0, RunParams p, GlobalBest& best,
     BkzTourContext ctx;
     ctx.status = p.report_status ? &status : nullptr;
 
+    // Per-worker flatter schedule (distinct segment size / offset / delta) so
+    // flattering workers explore different reduction paths. Inert when --flatter
+    // is off (reduce_whole and try_insert_block_vector then fall back to LLL).
+    const FlatterParams fp = make_flatter_params(p, id);
+    ctx.fp = &fp;  // used for the per-insertion block re-reduction in tours
+
     // When --no-init-lll is set the input is already reduced. Perturbation
     // helpers still shear to diversify but skip their follow-up LLL pass.
     const long long perturb_lll_cap = p.no_init_lll ? 0LL : -1LL;
@@ -1477,7 +1752,7 @@ static void worker(int id, const Lattice& L0, RunParams p, GlobalBest& best,
             if (p.report_status)
                 status.phase.store((int)WorkerPhase::warmup,
                                    std::memory_order_relaxed);
-            strong_randomize(local, rng, 1.0, perturb_lll_cap);
+            strong_randomize(local, rng, 1.0, perturb_lll_cap, fp, ctx.status);
             refresh_local_b0();
         }
 
@@ -1534,7 +1809,7 @@ static void worker(int id, const Lattice& L0, RunParams p, GlobalBest& best,
             // exploratory nudge for having fallen behind and snap us straight back
             // (which would loop on every improvement).
             if (promote(local, best)) {
-                light_nudge(local, rng, perturb_lll_cap);
+                light_nudge(local, rng, perturb_lll_cap, fp, ctx.status);
                 refresh_local_b0();  // reflect the perturbed basis in the UI only
             }
 
@@ -1548,7 +1823,7 @@ static void worker(int id, const Lattice& L0, RunParams p, GlobalBest& best,
                                        std::memory_order_relaxed);
                     if (reseed_from_best(local, best)) {
                         local_b0 = local.shortest_norm2();  // anchor at the frontier
-                        light_nudge(local, rng, perturb_lll_cap);
+                        light_nudge(local, rng, perturb_lll_cap, fp, ctx.status);
                         refresh_local_b0();  // UI only, local_b0 stays the anchor
                         stale = 0;
                     }
@@ -1590,10 +1865,10 @@ static void worker(int id, const Lattice& L0, RunParams p, GlobalBest& best,
                     if (reseed_from_best(local, best))
                         local_b0 = local.shortest_norm2();  // anchor at the frontier
                     strong_randomize(local, rng, std::clamp(0.5 + heat, 0.4, 1.0),
-                                     perturb_lll_cap);
+                                     perturb_lll_cap, fp, ctx.status);
                 } else {
                     strong_randomize(local, rng, std::clamp(0.3 + heat, 0.2, 0.7),
-                                     perturb_lll_cap);
+                                     perturb_lll_cap, fp, ctx.status);
                 }
                 // local_b0 stays anchored to the frontier we are exploring around.
                 // refresh only updates the UI with the perturbed basis.
@@ -1678,17 +1953,27 @@ int main(int argc, char** argv) {
     bool no_progressive = false;
     uint64_t seed = std::random_device{}();
     uint64_t modulus = 0;   // 0 = off; 1 = saturation; > 1 = balanced mod
+    int64_t saturate = 0;   // 0 = off; > 0 = clamp entries into [-saturate, saturate]
 
     app.add_option("-L,--lattice", l_csv,
                    "CSV lattice basis to reduce (rows are vectors)")->required();
     app.add_option("--modulus", modulus,
-                   "Reduce the loaded basis entries modulo this value once at "
-                   "load, to balanced residues in (-m/2, m/2]. A modulus of 1 "
-                   "selects saturation instead: nonzero entries become 1, 0 "
-                   "stays 0. Note the reduced basis spans a different lattice "
-                   "unless the original is m-ary; outputs refer to the reduced "
-                   "input")
+                   "Reduce a copy of the loaded basis entries modulo this value "
+                   "once at load, to balanced residues in (-m/2, m/2]. A modulus "
+                   "of 1 selects saturation instead: nonzero entries become 1, 0 "
+                   "stays 0. The reduction runs on the modified copy; the final "
+                   "unimodular transform is then applied to the original basis, "
+                   "so the outputs refer to the original lattice (requires the "
+                   "transform, i.e. not --no-transform)")
         ->check(CLI::Range((uint64_t)1, (uint64_t)INT64_MAX));
+    app.add_option("--saturate", saturate,
+                   "Clamp a copy of the loaded basis entries into "
+                   "[-N, N] once at load (entries above N become N, below -N "
+                   "become -N). Like --modulus, the reduction runs on the "
+                   "modified copy and the final unimodular transform is applied "
+                   "to the original basis, so the outputs refer to the original "
+                   "lattice (requires the transform, i.e. not --no-transform)")
+        ->check(CLI::Range((int64_t)1, (int64_t)INT64_MAX));
     app.add_option("-o,--out", out_csv, "Output CSV for the reduced basis");
     app.add_option("--transform-out", u_csv,
                    "Output CSV for the unimodular transform U (reduced = U * L)");
@@ -1733,6 +2018,17 @@ int main(int argc, char** argv) {
                    "capped at gh-factor * GH(block) (0 = off, no cap). Around "
                    "1.1 prunes hard blocks. Missed vectors are recovered by "
                    "re-randomization across tours and workers");
+    app.add_flag("--flatter", p.flatter,
+                 "Use the flatter-style segmented reducer for the whole-basis "
+                 "LLL calls (initial reduction and post-perturbation cleanup). "
+                 "Each worker uses a distinct segment schedule for reduction-"
+                 "path diversity; flatter passes show a blue progress bar");
+    app.add_option("--flatter-seg", p.flatter_seg,
+                   "Base segment (tile) size for the flatter reducer. Workers "
+                   "spread out around this value for diversity");
+    app.add_option("--flatter-iters", p.flatter_iters,
+                   "Maximum alternating segment sweeps per flatter pass before "
+                   "the final global LLL");
     app.add_option("--sieve-beta", p.sieve_beta,
                    "Use the block sieve instead of enumeration for tours whose "
                    "block size exceeds this (0 = enumeration only). A tour uses a "
@@ -1806,6 +2102,28 @@ int main(int argc, char** argv) {
         std::cerr << "error: --gh-factor must be >= 0 (0 = off)\n";
         return 1;
     }
+    if (p.flatter_seg < 4 || p.flatter_seg > 4096) {
+        std::cerr << "error: --flatter-seg must be in [4, 4096]\n";
+        return 1;
+    }
+    if (p.flatter_iters < 1 || p.flatter_iters > 1000) {
+        std::cerr << "error: --flatter-iters must be in [1, 1000]\n";
+        return 1;
+    }
+    // --modulus and --saturate both rewrite the loaded entries; only one such
+    // transform may be selected at a time.
+    if (modulus > 0 && saturate > 0) {
+        std::cerr << "error: --modulus and --saturate are mutually exclusive\n";
+        return 1;
+    }
+    // Both modes reduce a modified copy and then map the resulting unimodular
+    // transform back onto the original basis, which is impossible without the
+    // transform being tracked.
+    if ((modulus > 0 || saturate > 0) && !p.track_u) {
+        std::cerr << "error: --modulus / --saturate require the transform; "
+                     "they are incompatible with --no-transform\n";
+        return 1;
+    }
 
     Lattice L0;
     try {
@@ -1824,29 +2142,44 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (modulus > 0) {
-        reduce_entries_mod(L0.data, modulus);
-        std::cout << "[xbkz] " << modulus_note(modulus) << "\n";
+    // --modulus / --saturate rewrite the entries of a copy of the input. The
+    // reduction then runs on that copy while L0 keeps the untouched original,
+    // and the resulting unimodular transform is mapped back onto L0 at the end
+    // (see below). Lred points at whichever basis reduction actually operates
+    // on: the modified copy when remapping, else L0 itself.
+    const bool remap = (modulus > 0 || saturate > 0);
+    Lattice L_work;
+    const Lattice* Lred = &L0;
+    if (remap) {
+        L_work = L0;
+        if (modulus > 0) {
+            reduce_entries_mod(L_work.data, modulus);
+            std::cout << "[xbkz] " << modulus_note(modulus) << "\n";
+        } else {
+            saturate_entries(L_work.data, saturate);
+            std::cout << "[xbkz] " << saturate_note(saturate) << "\n";
+        }
         // A zero row cannot be part of a basis and would degenerate the GSO,
         // so reject it up front (rows that merely become dependent are caught
         // later by the reduction blowing up, not here).
-        for (int i = 0; i < L0.m; ++i) {
-            const int64_t* ri = L0.row(i);
+        for (int i = 0; i < L_work.m; ++i) {
+            const int64_t* ri = L_work.row(i);
             bool zero = true;
-            for (int k = 0; k < L0.d; ++k) if (ri[k] != 0) { zero = false; break; }
+            for (int k = 0; k < L_work.d; ++k) if (ri[k] != 0) { zero = false; break; }
             if (zero) {
                 std::cerr << "error: row " << i << " became zero under "
-                          << "--modulus " << modulus
-                          << ", the reduced basis is not full rank\n";
+                          << (modulus > 0 ? "--modulus" : "--saturate")
+                          << ", the modified basis is not full rank\n";
                 return 1;
             }
         }
+        Lred = &L_work;
     }
 
     real_t init_short = 0;
     {
         Reducer probe;
-        probe.init(L0, false);
+        probe.init(*Lred, false);
         init_short = probe.row_norm2(0);
         for (int i = 1; i < probe.n; ++i)
             init_short = std::min(init_short, probe.row_norm2(i));
@@ -1876,6 +2209,9 @@ int main(int argc, char** argv) {
     if (p.gh_factor > 0.0)
         std::cout << ", GH radius cap x" << p.gh_factor;
     std::cout << "\n";
+    if (p.flatter)
+        std::cout << "[xbkz] flatter reducer on (base segment " << p.flatter_seg
+                  << ", up to " << p.flatter_iters << " sweeps per pass)\n";
     if (p.max_seconds > 0.0)
         std::cout << "[xbkz] time budget " << p.max_seconds << " s\n";
     else
@@ -1884,11 +2220,13 @@ int main(int argc, char** argv) {
 
     GlobalBest best;
     if (p.no_init_lll)
-        std::cout << "[xbkz] skipping initial LLL (--no-init-lll)\n";
+        std::cout << "[xbkz] skipping initial reduction (--no-init-lll)\n";
+    else if (p.flatter)
+        std::cout << "[xbkz] initial flatter reduction...\n";
     else
         std::cout << "[xbkz] initial LLL reduction...\n";
     std::cout.flush();
-    if (!prepare_starting_basis(L0, p, best)) {
+    if (!prepare_starting_basis(*Lred, p, best)) {
         std::cerr << "error: initial LLL failed (basis overflow)\n";
         return 1;
     }
@@ -1899,7 +2237,8 @@ int main(int argc, char** argv) {
                       << std::sqrt((double)after)
                       << " (norm^2 = " << norm2_str(after) << ")\n";
         else
-            std::cout << "[xbkz] after initial LLL, shortest row norm "
+            std::cout << "[xbkz] after initial " << (p.flatter ? "flatter" : "LLL")
+                      << " reduction, shortest row norm "
                       << std::sqrt((double)after)
                       << " (norm^2 = " << norm2_str(after) << ")\n";
         // LLL orders rows by projected norm, so a short input row with a tiny
@@ -1907,8 +2246,8 @@ int main(int argc, char** argv) {
         // vector record keeps it, so the reported best never gets worse than
         // the input.
         if (best.vec_norm2 < (double)after * (1.0 - 1e-12))
-            std::cout << "[xbkz] initial LLL did not keep the shortest input "
-                         "row; it stays the best vector (norm "
+            std::cout << "[xbkz] initial reduction did not keep the shortest "
+                         "input row; it stays the best vector (norm "
                       << std::sqrt(best.vec_norm2)
                       << ", norm^2 = " << norm2_str((real_t)best.vec_norm2)
                       << ")\n";
@@ -1941,7 +2280,7 @@ int main(int argc, char** argv) {
                 SetThreadAffinityMask(GetCurrentThread(),
                                       core_masks[(size_t)i % core_masks.size()]);
 #endif
-            worker(i, L0, p, best, worker_status[(size_t)i]);
+            worker(i, *Lred, p, best, worker_status[(size_t)i]);
             workers_alive.fetch_sub(1, std::memory_order_relaxed);
         });
     }
@@ -1961,6 +2300,7 @@ int main(int argc, char** argv) {
         ui_cfg.lattice_d = L0.d;
         ui_cfg.init_short_norm2 = (double)init_short;
         ui_cfg.max_seconds = p.max_seconds;
+        ui_cfg.flatter = p.flatter;
         xbkz_ui_run(ui_cfg, start, worker_status, best, g_stop, [&]() {
             return workers_alive.load(std::memory_order_acquire) == 0;
         });
@@ -1977,10 +2317,40 @@ int main(int argc, char** argv) {
     if (g_interrupted.load(std::memory_order_relaxed))
         std::cout << "[interrupted] writing best basis found so far\n";
 
+    // In --modulus / --saturate mode the workers reduced the modified copy while
+    // best.U tracked reduced = U * L_work. Map that transform back onto the
+    // untouched original: best.B <- U * L0, so every output describes the
+    // original lattice. The modified copy is discarded here.
+    if (remap) {
+        if (!best.track_u || !best.u_valid) {
+            std::cerr << "error: the transform overflowed int64 during "
+                         "reduction, so the result cannot be mapped back to the "
+                         "original basis (try smaller --modulus / --saturate "
+                         "values)\n";
+            return 1;
+        }
+        std::vector<int64_t> remapped;
+        if (!apply_transform(best.U, L0, best.n, best.d, remapped)) {
+            std::cerr << "error: applying the transform to the original basis "
+                         "overflowed int64 (U * original does not fit in "
+                         "int64)\n";
+            return 1;
+        }
+        best.B.swap(remapped);
+        std::cout << "[xbkz] applied the transform to the original basis "
+                     "(reduced = U * original input)\n";
+    }
+
     int short_idx = 0;
     real_t final_short = flat_shortest_norm2(best.B, best.n, best.d, &short_idx);
     // The best vector record is monotone and seeded from the input rows, so it
-    // can be shorter than any row of the best basis (see GlobalBest::vec).
+    // can be shorter than any row of the best basis (see GlobalBest::vec). In
+    // remap mode that record tracked the modified lattice, so it does not apply
+    // to the original: drop it and report the shortest row of the remapped basis.
+    if (remap) {
+        best.vec.clear();
+        best.vec_norm2 = (double)final_short;
+    }
     const bool vec_beats_basis =
         !best.vec.empty() && best.vec_norm2 < (double)final_short * (1.0 - 1e-12);
     std::cout << "[xbkz] best shortest vector norm "

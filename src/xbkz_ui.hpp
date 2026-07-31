@@ -16,6 +16,7 @@ enum class WorkerPhase : int {
     reseed = 4,
     stopped = 5,
     sieving = 6,
+    flattering = 7,   // flatter-style whole-basis reduction (--flatter mode)
 };
 
 inline const char* worker_phase_name(WorkerPhase p) {
@@ -27,6 +28,7 @@ inline const char* worker_phase_name(WorkerPhase p) {
     case WorkerPhase::reseed: return "Reseed";
     case WorkerPhase::stopped: return "Stopped";
     case WorkerPhase::sieving: return "Sieving";
+    case WorkerPhase::flattering: return "Flattering";
     }
     return "?";
 }
@@ -42,6 +44,8 @@ struct WorkerStatus {
     std::atomic<int> block_h{ 0 };
     std::atomic<long long> sieve_step{ 0 };  // cumulative sieve attempts this pass
     std::atomic<long long> sieve_total{ 0 }; // total sieve budget (cap) for the pass
+    std::atomic<long long> flat_step{ 0 };   // work done in the current flatter pass
+    std::atomic<long long> flat_total{ 0 };  // total work (cap) for the flatter pass
     std::atomic<long long> enum_nodes{ 0 };
     std::atomic<int> tours_changed{ 0 };
     std::atomic<int> blocks_hit{ 0 };
@@ -85,6 +89,7 @@ struct BkzUiConfig {
     int lattice_d = 0;
     double init_short_norm2 = 0.0;
     double max_seconds = 0.0;
+    bool flatter = false;  // --flatter: draw tour/sieve bars blue to signal mode
 };
 
 using SteadyClock = std::chrono::steady_clock;
